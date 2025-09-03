@@ -1,0 +1,82 @@
+# JVM Tool Git Attributes
+
+# ===========================================
+# 行结束符设置
+# ===========================================
+
+# 默认行为：自动处理行结束符
+* text=auto
+
+# 源代码文件：强制使用 LF
+*.go text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# ===========================================
+# 脚本文件
+# ===========================================
+
+# Shell 脚本：使用 LF
+*.sh text eol=lf
+*.bash text eol=lf
+
+# PowerShell 脚本：使用 CRLF (Windows 兼容性)
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# 批处理文件：使用 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# ===========================================
+# 二进制文件
+# ===========================================
+
+# 可执行文件
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+
+# 图片文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg text
+
+# 压缩文件
+*.zip binary
+*.tar.gz binary
+*.rar binary
+*.7z binary
+
+# ===========================================
+# 语言检测
+# ===========================================
+
+# Go 文件
+*.go linguist-language=Go
+
+# 文档文件
+*.md linguist-documentation
+README.md linguist-documentation=false
+
+# 配置文件
+*.json linguist-language=JSON
+*.yml linguist-language=YAML
+*.yaml linguist-language=YAML
+
+# ===========================================
+# 导出忽略
+# ===========================================
+
+# 开发文件不包含在导出中
+.gitignore export-ignore
+.gitattributes export-ignore
+*.test export-ignore
+test/ export-ignore
