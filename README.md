@@ -24,7 +24,7 @@ JVM 是一个功能强大、简单易用的 Java 版本管理工具，灵感来�
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/yumu775/jvm.git
 cd jvm
 
 # 下载依赖
