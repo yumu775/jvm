@@ -14,8 +14,8 @@ Thank you for your interest in contributing to JVM Tool! This document provides 
 
 1. **Fork and Clone**
    ```bash
-   git clone https://github.com/yourusername/jvm-tool.git
-   cd jvm-tool
+   git clone https://github.com/yumu775/jvm.git
+   cd jvm
    ```
 
 2. **Install Dependencies**
