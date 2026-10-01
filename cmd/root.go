@@ -7,8 +7,10 @@ import (
 // rootCmd 是应用程序的根命令
 // 在 Cobra 中，所有的子命令都会添加到这个根命令上
 var rootCmd = &cobra.Command{
-	Use:   "jvm",
-	Short: "Java Version Manager - 类似 nvm 的 Java 版本管理工具",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	Use:           "jvm",
+	Short:         "Java Version Manager - 类似 nvm 的 Java 版本管理工具",
 	Long: `JVM 是一个简单易用的 Java 版本管理工具，灵感来自 nvm。
 
 它允许你轻松地：
@@ -31,6 +33,9 @@ var rootCmd = &cobra.Command{
 // Execute 函数执行根命令
 // 这个函数会被 main.go 调用
 func Execute() error {
+	if handled, err := executeDesktopLaunch(); handled {
+		return err
+	}
 	return rootCmd.Execute()
 }
 
@@ -41,7 +46,7 @@ func init() {
 	// 例如：rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
 
 	// 设置版本信息
-	rootCmd.Version = "1.0.0"
+	rootCmd.Version = Version
 
 	// 添加子命令
 	rootCmd.AddCommand(listCmd)
@@ -60,4 +65,6 @@ func init() {
 	rootCmd.AddCommand(platformCmd)
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(shellInitCmd)
+	installEnvironmentCommandLocks()
 }

@@ -65,18 +65,18 @@ var platformShellsCmd = &cobra.Command{
 func showPlatformInfo() error {
 	color.Blue("=== Platform Information ===")
 	fmt.Println()
-	
+
 	// 基本系统信息
 	color.Green("System Information:")
 	fmt.Printf("  Operating System: %s\n", runtime.GOOS)
 	fmt.Printf("  Architecture: %s\n", runtime.GOARCH)
 	fmt.Printf("  Go Runtime: %s\n", runtime.Version())
 	fmt.Printf("  CPU Cores: %d\n", runtime.NumCPU())
-	
+
 	// 平台特定信息
 	fmt.Println()
 	color.Green("Platform Details:")
-	
+
 	switch runtime.GOOS {
 	case "windows":
 		fmt.Printf("  Platform: Microsoft Windows\n")
@@ -84,26 +84,26 @@ func showPlatformInfo() error {
 		fmt.Printf("  Path Separator: \\\n")
 		fmt.Printf("  Executable Extension: .exe\n")
 		fmt.Printf("  Default Shell: PowerShell/CMD\n")
-		
+
 	case "darwin":
 		fmt.Printf("  Platform: macOS\n")
 		fmt.Printf("  Package Format: tar.gz archives\n")
 		fmt.Printf("  Path Separator: /\n")
 		fmt.Printf("  Executable Extension: (none)\n")
 		fmt.Printf("  Default Shell: zsh/bash\n")
-		
+
 	case "linux":
 		fmt.Printf("  Platform: Linux\n")
 		fmt.Printf("  Package Format: tar.gz archives\n")
 		fmt.Printf("  Path Separator: /\n")
 		fmt.Printf("  Executable Extension: (none)\n")
 		fmt.Printf("  Default Shell: bash\n")
-		
+
 	default:
 		fmt.Printf("  Platform: %s (experimental support)\n", runtime.GOOS)
 		color.Yellow("  Warning: This platform may have limited support")
 	}
-	
+
 	return nil
 }
 
@@ -111,14 +111,14 @@ func showPlatformInfo() error {
 func showPlatformFeatures() error {
 	color.Blue("=== Platform Features ===")
 	fmt.Println()
-	
+
 	features := getPlatformFeatures()
-	
+
 	color.Green("Supported Features:")
 	for _, feature := range features.Supported {
 		color.Green("  ✓ %s", feature)
 	}
-	
+
 	if len(features.Limited) > 0 {
 		fmt.Println()
 		color.Yellow("Limited Support:")
@@ -126,7 +126,7 @@ func showPlatformFeatures() error {
 			color.Yellow("  ⚠ %s", feature)
 		}
 	}
-	
+
 	if len(features.Unsupported) > 0 {
 		fmt.Println()
 		color.Red("Unsupported Features:")
@@ -134,7 +134,7 @@ func showPlatformFeatures() error {
 			color.Red("  ✗ %s", feature)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -142,24 +142,23 @@ func showPlatformFeatures() error {
 func showShellSupport() error {
 	color.Blue("=== Shell Support ===")
 	fmt.Println()
-	
+
 	envManager := env.NewManager()
-	
+
 	// 检测当前 Shell
 	shell, err := envManager.DetectShell()
 	if err != nil {
-		color.Red("Failed to detect shell: %v", err)
-		return nil
+		return fmt.Errorf("detect shell: %w", err)
 	}
-	
+
 	color.Green("Current Shell:")
 	fmt.Printf("  Name: %s\n", shell.Name)
 	fmt.Printf("  Config File: %s\n", shell.ConfigFile)
 	fmt.Printf("  Set Command: %s\n", shell.SetCommand)
-	
+
 	fmt.Println()
 	color.Green("Supported Shells:")
-	
+
 	shellSupport := getShellSupport()
 	for shellName, support := range shellSupport {
 		status := color.GreenString("✓ Full")
@@ -169,13 +168,13 @@ func showShellSupport() error {
 		if !support.Supported {
 			status = color.RedString("✗ No")
 		}
-		
+
 		fmt.Printf("  %s: %s\n", shellName, status)
 		if support.Notes != "" {
 			fmt.Printf("    Notes: %s\n", support.Notes)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -196,40 +195,41 @@ func getPlatformFeatures() PlatformFeatures {
 			"Environment variable management",
 			"System Java scanning",
 			"Project configuration (.jvmrc)",
-			"Multiple download sources",
+			"Temurin/Zulu/Corretto/GraalVM catalogs and verified downloads",
 			"Version aliases",
 			"Uninstallation",
 		},
 	}
-	
+
 	switch runtime.GOOS {
 	case "windows":
 		features.Supported = append(features.Supported,
 			"PowerShell integration",
 			"ZIP archive extraction",
-			"Windows registry detection",
+			"Persistent user JAVA_HOME and PATH",
 		)
 		features.Limited = []string{
-			"CMD shell support (manual setup required)",
-			"Symbolic links (requires admin privileges)",
+			"Existing terminals require explicit shell activation",
+			"IDE and Gradle JDK settings may override JAVA_HOME",
+			"User PATH does not override entries in machine PATH",
 		}
-		
+
 	case "darwin":
 		features.Supported = append(features.Supported,
 			"Bash/Zsh integration",
 			"tar.gz archive extraction",
 			"Symbolic links",
-			"Homebrew detection",
+			"External JDK registration without copying",
 		)
-		
+
 	case "linux":
 		features.Supported = append(features.Supported,
 			"Bash/Zsh/Fish integration",
 			"tar.gz archive extraction",
 			"Symbolic links",
-			"Package manager detection",
+			"External JDK registration without copying",
 		)
-		
+
 	default:
 		features.Limited = append(features.Limited,
 			"Experimental platform support",
@@ -239,7 +239,7 @@ func getPlatformFeatures() PlatformFeatures {
 			"Automatic environment variable setup",
 		}
 	}
-	
+
 	return features
 }
 
@@ -253,24 +253,23 @@ type ShellSupport struct {
 // getShellSupport 获取 Shell 支持信息
 func getShellSupport() map[string]ShellSupport {
 	support := make(map[string]ShellSupport)
-	
+
 	switch runtime.GOOS {
 	case "windows":
 		support["PowerShell"] = ShellSupport{
 			Supported: true,
-			Notes:     "Full automatic configuration support",
+			Notes:     "Persistent user environment; activate existing sessions with jvm env --shell powershell",
 		}
 		support["CMD"] = ShellSupport{
 			Supported: true,
-			Limited:   true,
-			Notes:     "Manual environment variable setup required",
+			Notes:     "Persistent user environment; activate existing sessions with jvm env --shell cmd",
 		}
 		support["Git Bash"] = ShellSupport{
 			Supported: true,
 			Limited:   true,
-			Notes:     "Uses bash-style configuration",
+			Notes:     "Use Windows CMD/PowerShell activation; MSYS path conversion is not automatically configured",
 		}
-		
+
 	case "darwin", "linux":
 		support["Bash"] = ShellSupport{
 			Supported: true,
@@ -284,7 +283,7 @@ func getShellSupport() map[string]ShellSupport {
 			Supported: true,
 			Notes:     "Full automatic configuration support",
 		}
-		
+
 	default:
 		support["Default"] = ShellSupport{
 			Supported: true,
@@ -292,7 +291,7 @@ func getShellSupport() map[string]ShellSupport {
 			Notes:     "Basic support, manual configuration may be required",
 		}
 	}
-	
+
 	return support
 }
 

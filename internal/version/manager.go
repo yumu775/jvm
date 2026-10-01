@@ -2,233 +2,393 @@ package version
 
 import (
 	"fmt"
+	"jvm/internal/config"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
-
-	"jvm/internal/config"
 )
 
-// Manager 结构体负责管理 Java 版本
-// 它包含了配置信息，用于执行各种版本管理操作
-type Manager struct {
-	config *config.Config
+type Manager struct{ config *config.Config }
+type JavaVersion struct {
+	Version string
+	Path    string
+	Current bool
 }
 
-// NewManager 创建一个新的版本管理器实例
-// 这是 Go 中常见的构造函数模式
 func NewManager() (*Manager, error) {
+	c, e := config.LoadConfig()
+	if e != nil {
+		return nil, e
+	}
+	return &Manager{config: c}, nil
+}
+
+// ValidateVersion 防止版本标识被解释为文件路径。
+func ValidateVersion(v string) error {
+	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+\-]*$`).MatchString(v) || strings.Contains(v, "..") {
+		return fmt.Errorf("invalid version: %q", v)
+	}
+	return nil
+}
+func (m *Manager) ListInstalled() ([]JavaVersion, error) {
+	c, e := config.LoadConfig()
+	if e != nil {
+		return nil, e
+	}
+	m.config = c
+	found := map[string]string{}
+	dir, e := config.GetVersionsDir()
+	if e != nil {
+		return nil, e
+	}
+	entries, e := os.ReadDir(dir)
+	if e != nil && !os.IsNotExist(e) {
+		return nil, e
+	}
+	for _, entry := range entries {
+		v := strings.TrimPrefix(entry.Name(), "java-")
+		p := filepath.Join(dir, entry.Name())
+		if _, registered := c.Installations[v]; registered || ignoredLegacyPath(c, p) {
+			continue
+		}
+		if ValidateVersion(v) == nil && m.isValidJavaInstallation(p) {
+			found[v] = p
+		}
+	}
+	for v, r := range c.Installations {
+		if ValidateVersion(v) == nil && m.isValidJavaInstallation(r.Path) {
+			found[v] = r.Path
+		}
+	}
+	result := []JavaVersion{}
+	for v, p := range found {
+		result = append(result, JavaVersion{v, p, v == c.CurrentVersion})
+	}
+	sort.Slice(result, func(i, j int) bool { return compareVersions(result[i].Version, result[j].Version) < 0 })
+	return result, nil
+}
+func (m *Manager) GetRecord(v string) (config.Installation, error) {
+	resolved, e := m.Resolve(v)
+	if e != nil {
+		return config.Installation{}, e
+	}
+	v = resolved
+	if e := ValidateVersion(v); e != nil {
+		return config.Installation{}, e
+	}
+	c, e := config.LoadConfig()
+	if e != nil {
+		return config.Installation{}, e
+	}
+	m.config = c
+	if r, ok := c.Installations[v]; ok {
+		if !filepath.IsAbs(r.Path) {
+			return r, fmt.Errorf("registered path must be absolute")
+		}
+		return r, nil
+	}
+	dir, e := config.GetVersionsDir()
+	if e != nil {
+		return config.Installation{}, e
+	}
+	for _, name := range []string{"java-" + v, v} {
+		p := filepath.Join(dir, name)
+		if ignoredLegacyPath(c, p) {
+			continue
+		}
+		if m.isValidJavaInstallation(p) {
+			info, e := os.Lstat(p)
+			if e != nil {
+				return config.Installation{}, e
+			}
+			return config.Installation{Path: p, Managed: info.Mode()&os.ModeSymlink == 0}, nil
+		}
+	}
+	return config.Installation{}, fmt.Errorf("Java version %s is not installed", v)
+}
+func (m *Manager) GetVersionPath(v string) (string, error) {
+	r, e := m.GetRecord(v)
+	if e != nil {
+		return "", e
+	}
+	if !m.isValidJavaInstallation(r.Path) {
+		return "", fmt.Errorf("invalid Java installation: %s", r.Path)
+	}
+	return r.Path, nil
+}
+func (m *Manager) IsInstalled(v string) bool { _, e := m.GetVersionPath(v); return e == nil }
+func (m *Manager) GetCurrent() (string, error) {
+	c, e := config.LoadConfig()
+	if e != nil {
+		return "", e
+	}
+	if c.CurrentVersion == "" || !m.IsInstalled(c.CurrentVersion) {
+		return "", fmt.Errorf("no installed Java version is currently active")
+	}
+	return c.CurrentVersion, nil
+}
+func (m *Manager) SetCurrent(v string) error {
+	resolved, e := m.Resolve(v)
+	if e != nil {
+		return e
+	}
+	v = resolved
+	if !m.IsInstalled(v) {
+		return fmt.Errorf("Java version %s is not installed", v)
+	}
+	return config.Update(func(c *config.Config) error { c.CurrentVersion = v; return nil })
+}
+
+// Register 登记真实安装位置，外部导入不取得文件删除权。
+func (m *Manager) Register(v, path string, managed bool) error {
+	return m.register(v, path, managed, nil)
+}
+
+// RegisterRelease 保存厂商与真实版本，避免不同发行版同版本互相覆盖。
+func (m *Manager) RegisterRelease(id, path, actual, source, vendor string) error {
+	return m.register(id, path, true, &config.Installation{Version: actual, Source: source, Vendor: vendor})
+}
+
+func (m *Manager) register(v, path string, managed bool, metadata *config.Installation) error {
+	if e := ValidateVersion(v); e != nil {
+		return e
+	}
+	p, e := config.AbsolutePath(path)
+	if e != nil {
+		return e
+	}
+	if !m.isValidJavaInstallation(p) {
+		return fmt.Errorf("invalid Java installation: %s", p)
+	}
+	if managed {
+		if info, err := os.Lstat(p); err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("managed installation must be a real directory: %s", p)
+		}
+		p, e = filepath.EvalSymlinks(p)
+		if e != nil {
+			return e
+		}
+		if e := ValidateRemovalPath(p); e != nil {
+			return e
+		}
+	}
+	return config.Update(func(c *config.Config) error {
+		if c.Installations == nil {
+			c.Installations = map[string]config.Installation{}
+		}
+		if old, ok := c.Installations[v]; ok {
+			if !samePath(old.Path, p) {
+				return fmt.Errorf("version %s is already registered at %s", v, old.Path)
+			}
+			managed = old.Managed
+		}
+		for other, r := range c.Installations {
+			if other != v && samePath(r.Path, p) && (managed || r.Managed) {
+				return fmt.Errorf("installation path already owned by version %s", other)
+			}
+		}
+		record := c.Installations[v]
+		record.Path, record.Managed = p, managed
+		if metadata != nil {
+			record.Version, record.Source, record.Vendor = metadata.Version, metadata.Source, metadata.Vendor
+		}
+		c.Installations[v] = record
+		kept := c.IgnoredLegacyPaths[:0]
+		for _, ignored := range c.IgnoredLegacyPaths {
+			if !sameInstallationPath(ignored, p) {
+				kept = append(kept, ignored)
+			}
+		}
+		c.IgnoredLegacyPaths = kept
+		return nil
+	})
+}
+func (m *Manager) Unregister(v string) error {
+	if e := ValidateVersion(v); e != nil {
+		return e
+	}
+	return config.Update(func(c *config.Config) error {
+		if record, ok := c.Installations[v]; ok && !record.Managed && !ignoredLegacyPath(c, record.Path) {
+			c.IgnoredLegacyPaths = append(c.IgnoredLegacyPaths, record.Path)
+		}
+		delete(c.Installations, v)
+		if c.CurrentVersion == v {
+			c.CurrentVersion = ""
+		}
+		if c.DefaultVersion == v {
+			c.DefaultVersion = ""
+		}
+		return nil
+	})
+}
+
+func ignoredLegacyPath(c *config.Config, path string) bool {
+	for _, ignored := range c.IgnoredLegacyPaths {
+		if sameInstallationPath(ignored, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameInstallationPath(a, b string) bool {
+	if real, err := filepath.EvalSymlinks(a); err == nil {
+		a = real
+	}
+	if real, err := filepath.EvalSymlinks(b); err == nil {
+		b = real
+	}
+	return samePath(a, b)
+}
+
+// ValidateRemovalPath 拒绝根目录、受保护目录和被重定向的路径。
+func ValidateRemovalPath(p string) error {
+	if !filepath.IsAbs(p) || filepath.Dir(p) == p {
+		return fmt.Errorf("unsafe installation path: %s", p)
+	}
+	for _, get := range []func() (string, error){os.UserHomeDir, config.GetJVMDir, config.GetVersionsDir, config.GetDownloadsDir} {
+		root, e := get()
+		if e != nil {
+			return e
+		}
+		rel, err := filepath.Rel(p, root)
+		if samePath(root, p) || (err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+			return fmt.Errorf("refusing to remove protected directory: %s", p)
+		}
+	}
+	resolved, e := filepath.EvalSymlinks(p)
+	if e != nil {
+		return e
+	}
+	if !samePath(resolved, p) {
+		return fmt.Errorf("managed installation contains a redirected path: %s", p)
+	}
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load config: %w", err)
+		return err
 	}
-	
-	return &Manager{
-		config: cfg,
-	}, nil
-}
-
-// JavaVersion 表示一个 Java 版本的信息
-type JavaVersion struct {
-	Version string // 版本号，如 "17.0.8"
-	Path    string // 安装路径
-	Current bool   // 是否为当前激活版本
-}
-
-// ListInstalled 列出所有已安装的 Java 版本
-// 这个方法展示了如何遍历目录和处理文件系统操作
-func (m *Manager) ListInstalled() ([]JavaVersion, error) {
-	versionsDir, err := config.GetVersionsDir()
-	if err != nil {
-		return nil, err
+	for _, ignored := range cfg.IgnoredLegacyPaths {
+		other := ignored
+		if real, err := filepath.EvalSymlinks(other); err == nil {
+			other = real
+		}
+		rel, err := filepath.Rel(p, other)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("installation contains retained external Java at %s", ignored)
+		}
 	}
-	
-	// 检查版本目录是否存在
-	if _, err := os.Stat(versionsDir); os.IsNotExist(err) {
-		// 如果目录不存在，返回空列表
-		return []JavaVersion{}, nil
-	}
-	
-	// 读取版本目录中的所有条目
-	entries, err := os.ReadDir(versionsDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read versions directory: %w", err)
-	}
-	
-	var versions []JavaVersion
-	
-	// 遍历每个条目
-	for _, entry := range entries {
-		// 处理目录和符号链接
-		info, err := entry.Info()
-		if err != nil {
+	for id, record := range cfg.Installations {
+		other := record.Path
+		if real, err := filepath.EvalSymlinks(other); err == nil {
+			other = real
+		}
+		rel, err := filepath.Rel(p, other)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			continue
 		}
-
-		// 跳过普通文件，但允许目录和符号链接
-		if !entry.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		if samePath(p, other) && record.Managed {
 			continue
 		}
-
-		versionName := entry.Name()
-		versionPath := filepath.Join(versionsDir, versionName)
-
-		// 验证这是一个有效的 Java 安装
-		if !m.isValidJavaInstallation(versionPath) {
-			continue
+		return fmt.Errorf("installation contains protected registered Java %s at %s", id, record.Path)
+	}
+	return nil
+}
+func samePath(a, b string) bool {
+	a = filepath.Clean(a)
+	b = filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+func (m *Manager) isValidJavaInstallation(p string) bool {
+	exe := "java"
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	info, e := os.Stat(filepath.Join(p, "bin", exe))
+	return e == nil && !info.IsDir()
+}
+func compareVersions(a, b string) int {
+	digits := regexp.MustCompile(`[0-9]+`)
+	aa := digits.FindAllString(a, -1)
+	bb := digits.FindAllString(b, -1)
+	for i := 0; i < len(aa) || i < len(bb); i++ {
+		var x, y uint64
+		if i < len(aa) {
+			x, _ = strconv.ParseUint(aa[i], 10, 64)
 		}
-
-		// 提取版本号
-		var version string
-		if strings.HasPrefix(versionName, "java-") {
-			// 标准格式：java-17, java-11.0.19
-			version = strings.TrimPrefix(versionName, "java-")
-		} else {
-			// 直接使用目录名作为版本号
-			version = versionName
+		if i < len(bb) {
+			y, _ = strconv.ParseUint(bb[i], 10, 64)
 		}
-
-		// 检查是否为当前激活版本
-		isCurrent := version == m.config.CurrentVersion
-
-		versions = append(versions, JavaVersion{
-			Version: version,
-			Path:    versionPath,
-			Current: isCurrent,
-		})
-	}
-	
-	// 按版本号排序
-	sort.Slice(versions, func(i, j int) bool {
-		return compareVersions(versions[i].Version, versions[j].Version) < 0
-	})
-	
-	return versions, nil
-}
-
-// GetCurrent 获取当前激活的 Java 版本
-func (m *Manager) GetCurrent() (string, error) {
-	if m.config.CurrentVersion == "" {
-		return "", fmt.Errorf("no Java version is currently active")
-	}
-	
-	// 验证当前版本是否仍然存在
-	if !m.IsInstalled(m.config.CurrentVersion) {
-		return "", fmt.Errorf("current version %s is no longer installed", m.config.CurrentVersion)
-	}
-	
-	return m.config.CurrentVersion, nil
-}
-
-// IsInstalled 检查指定版本是否已安装
-func (m *Manager) IsInstalled(version string) bool {
-	versionsDir, err := config.GetVersionsDir()
-	if err != nil {
-		return false
-	}
-
-	// 尝试标准格式 java-version
-	versionPath := filepath.Join(versionsDir, "java-"+version)
-	if m.isValidJavaInstallation(versionPath) {
-		return true
-	}
-
-	// 尝试直接使用版本号作为目录名
-	versionPath = filepath.Join(versionsDir, version)
-	return m.isValidJavaInstallation(versionPath)
-}
-
-// GetVersionPath 获取指定版本的安装路径
-func (m *Manager) GetVersionPath(version string) (string, error) {
-	versionsDir, err := config.GetVersionsDir()
-	if err != nil {
-		return "", err
-	}
-
-	// 尝试标准格式 java-version
-	versionPath := filepath.Join(versionsDir, "java-"+version)
-	if m.isValidJavaInstallation(versionPath) {
-		return versionPath, nil
-	}
-
-	// 尝试直接使用版本号作为目录名
-	versionPath = filepath.Join(versionsDir, version)
-	if m.isValidJavaInstallation(versionPath) {
-		return versionPath, nil
-	}
-
-	return "", fmt.Errorf("Java version %s is not installed", version)
-}
-
-// SetCurrent 设置当前激活的 Java 版本
-func (m *Manager) SetCurrent(version string) error {
-	if !m.IsInstalled(version) {
-		return fmt.Errorf("Java version %s is not installed", version)
-	}
-	
-	m.config.CurrentVersion = version
-	return m.config.SaveConfig()
-}
-
-// isValidJavaInstallation 检查指定路径是否包含有效的 Java 安装
-// 这个方法展示了如何验证文件和目录的存在
-func (m *Manager) isValidJavaInstallation(path string) bool {
-	// 检查基本目录结构
-	binDir := filepath.Join(path, "bin")
-	if _, err := os.Stat(binDir); os.IsNotExist(err) {
-		return false
-	}
-	
-	// 检查 java 可执行文件
-	javaExe := "java"
-	if strings.Contains(strings.ToLower(os.Getenv("OS")), "windows") {
-		javaExe = "java.exe"
-	}
-	
-	javaPath := filepath.Join(binDir, javaExe)
-	if _, err := os.Stat(javaPath); os.IsNotExist(err) {
-		return false
-	}
-	
-	return true
-}
-
-// compareVersions 比较两个版本号
-// 返回值：< 0 表示 v1 < v2，0 表示相等，> 0 表示 v1 > v2
-func compareVersions(v1, v2 string) int {
-	// 简化的版本比较逻辑
-	// 在实际项目中，你可能需要更复杂的版本比较算法
-	
-	// 分割版本号
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
-	
-	// 比较每个部分
-	maxLen := len(parts1)
-	if len(parts2) > maxLen {
-		maxLen = len(parts2)
-	}
-	
-	for i := 0; i < maxLen; i++ {
-		var p1, p2 string
-		if i < len(parts1) {
-			p1 = parts1[i]
-		} else {
-			p1 = "0"
-		}
-		if i < len(parts2) {
-			p2 = parts2[i]
-		} else {
-			p2 = "0"
-		}
-		
-		if p1 < p2 {
+		if x < y {
 			return -1
-		} else if p1 > p2 {
+		}
+		if x > y {
 			return 1
 		}
 	}
-	
-	return 0
+	return strings.Compare(a, b)
+}
+
+// Resolve 优先精确版本，数字简写选择已安装的最高补丁版本。
+func (m *Manager) Resolve(v string) (string, error) {
+	if err := ValidateVersion(v); err != nil {
+		return "", err
+	}
+	c, err := config.LoadConfig()
+	if err != nil {
+		return "", err
+	}
+	if v == "default" {
+		if c.DefaultVersion == "" || c.DefaultVersion == "default" {
+			return "", fmt.Errorf("no default alias configured; use jvm config set default-version <installed-version>")
+		}
+		return m.Resolve(c.DefaultVersion)
+	}
+	if _, ok := c.Installations[v]; ok {
+		return v, nil
+	}
+	items, err := m.ListInstalled()
+	if err != nil {
+		return "", err
+	}
+	for _, item := range items {
+		if item.Version == v {
+			return v, nil
+		}
+	}
+	if !regexp.MustCompile(`^[0-9]+(\.[0-9]+)*(\+[0-9A-Za-z.-]+)?$`).MatchString(v) {
+		return "", fmt.Errorf("Java version %s is not installed", v)
+	}
+	best := ""
+	bestVersion := ""
+	matchedSources := map[string]bool{}
+	choices := []string{}
+	for _, item := range items {
+		record := c.Installations[item.Version]
+		actual := record.Version
+		if actual == "" {
+			actual = item.Version
+		}
+		if actual == v || strings.HasPrefix(actual, v+".") || strings.HasPrefix(actual, v+"+") {
+			matchedSources[record.Source] = true
+			choices = append(choices, item.Version)
+			if best == "" || compareVersions(actual, bestVersion) > 0 {
+				best = item.Version
+				bestVersion = actual
+			}
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf("Java version %s is not installed", v)
+	}
+	if len(matchedSources) > 1 {
+		return "", fmt.Errorf("Java %s matches multiple distributions; use an exact ID: %s", v, strings.Join(choices, ", "))
+	}
+	return best, nil
 }

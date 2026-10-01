@@ -2,144 +2,197 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"sort"
+	"strconv"
+	"strings"
+	"text/tabwriter"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"jvm/internal/sources"
 )
 
-// sourcesCmd 定义了 "jvm sources" 命令
 var sourcesCmd = &cobra.Command{
-	Use:   "sources",
-	Short: "管理 Java 下载源",
-	Long: `管理 Java 下载源配置。
+	Use: "sources", Short: "查看下载源状态，设置默认发行版与优先级",
+	Long: `管理 Java 下载源。默认显示紧凑列表，不访问网络。
 
-支持的下载源：
-- adoptium: Eclipse Adoptium (Temurin)
-- corretto: Amazon Corretto
-- zulu: Azul Zulu
-- oracle: Oracle JDK
-- graalvm: GraalVM
+sources check [name] 刷新 Java 17 元数据，逐源显示可用性与错误。
+sources default [name] 查看或设置默认安装来源。
+sources priority <name> <n> 调整列表与查询优先级（数字越小越靠前）。
 
-子命令：
-  list      列出所有可用的下载源
-  enable    启用指定的下载源
-  disable   禁用指定的下载源`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		// 默认显示源列表
-		return listSources()
-	},
+默认来源或显式 --source 失败时，安装不会静默切换 Java 厂商。
+Oracle 暂不支持自动下载，请从官方获取 JDK 后使用 jvm import。`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error { return listSourcesTo(cmd.OutOrStdout()) },
 }
 
-// sourcesListCmd 列出所有下载源
 var sourcesListCmd = &cobra.Command{
-	Use:   "list",
-	Short: "列出所有可用的下载源",
-	Long: `列出所有可用的 Java 下载源及其状态。
-
-显示每个源的名称、状态、描述和网站信息。`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return listSources()
-	},
+	Use: "list", Short: "列出配置状态（不进行网络请求）", Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error { return listSourcesTo(cmd.OutOrStdout()) },
 }
 
-// sourcesEnableCmd 启用下载源
 var sourcesEnableCmd = &cobra.Command{
-	Use:   "enable <source>",
-	Short: "启用指定的下载源",
-	Long: `启用指定的 Java 下载源。
-
-示例：
-  jvm sources enable oracle     # 启用 Oracle JDK 源
-  jvm sources enable graalvm    # 启用 GraalVM 源`,
-	Args: cobra.ExactArgs(1),
+	Use: "enable <source>", Short: "启用指定下载源", Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		sourceName := args[0]
-		
-		// TODO: 实现启用源的逻辑
-		color.Green("Enabled source: %s", sourceName)
-		color.Yellow("Note: Source management is not yet fully implemented")
-		
+		if err := sources.NewSourceManager().SetEnabled(args[0], true); err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Enabled source: %s\n", args[0])
 		return nil
 	},
 }
 
-// sourcesDisableCmd 禁用下载源
 var sourcesDisableCmd = &cobra.Command{
-	Use:   "disable <source>",
-	Short: "禁用指定的下载源",
-	Long: `禁用指定的 Java 下载源。
-
-示例：
-  jvm sources disable oracle    # 禁用 Oracle JDK 源
-  jvm sources disable graalvm   # 禁用 GraalVM 源`,
-	Args: cobra.ExactArgs(1),
+	Use: "disable <source>", Short: "禁用指定下载源", Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		sourceName := args[0]
-		
-		// TODO: 实现禁用源的逻辑
-		color.Yellow("Disabled source: %s", sourceName)
-		color.Yellow("Note: Source management is not yet fully implemented")
-		
+		manager := sources.NewSourceManager()
+		if err := manager.SetEnabled(args[0], false); err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Disabled source: %s\n", args[0])
+		selected, err := manager.DefaultSource()
+		if err == nil && selected == args[0] {
+			fmt.Fprintln(cmd.OutOrStdout(), "The default source is disabled. Choose another with jvm sources default <name> before installing.")
+		}
 		return nil
 	},
 }
 
-// listSources 列出所有下载源
-func listSources() error {
-	sourceManager := sources.NewSourceManager()
-	javaSources := sourceManager.GetDefaultSources()
-	
-	// 按优先级排序
-	sort.Slice(javaSources, func(i, j int) bool {
-		return javaSources[i].Priority < javaSources[j].Priority
-	})
-	
-	color.Blue("=== Java Download Sources ===")
-	fmt.Println()
-	
-	for _, source := range javaSources {
-		// 显示状态
-		status := color.RedString("Disabled")
-		if source.Enabled {
-			status = color.GreenString("Enabled")
+var sourcesDefaultCmd = &cobra.Command{
+	Use: "default [source]", Short: "查看或设置默认安装发行版", Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		manager := sources.NewSourceManager()
+		if len(args) == 0 {
+			name, err := manager.DefaultSource()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), name)
+			return nil
 		}
-		
-		fmt.Printf("%s (%s)\n", color.CyanString(source.DisplayName), status)
-		fmt.Printf("  Name: %s\n", source.Name)
-		fmt.Printf("  Priority: %d\n", source.Priority)
-		fmt.Printf("  API Type: %s\n", source.APIType)
-		
-		if description, exists := source.Metadata["description"]; exists {
-			fmt.Printf("  Description: %s\n", description)
+		if err := manager.SetDefault(args[0]); err != nil {
+			return err
 		}
-		
-		if website, exists := source.Metadata["website"]; exists {
-			fmt.Printf("  Website: %s\n", website)
-		}
-		
-		if license, exists := source.Metadata["license"]; exists {
-			color.Yellow("  License: %s", license)
-		}
-		
-		fmt.Println()
-	}
-	
-	// 显示使用提示
-	color.Cyan("Usage:")
-	fmt.Printf("  jvm install 17 --source adoptium    # 从特定源安装\n")
-	fmt.Printf("  jvm list-remote --source corretto   # 列出特定源的版本\n")
-	fmt.Printf("  jvm sources enable oracle           # 启用源\n")
-	fmt.Printf("  jvm sources disable graalvm         # 禁用源\n")
-	
-	return nil
+		fmt.Fprintf(cmd.OutOrStdout(), "Default installation source: %s\n", args[0])
+		fmt.Fprintln(cmd.OutOrStdout(), "If this source fails, installation returns an error; another vendor is never selected silently.")
+		return nil
+	},
 }
 
-// init 函数初始化 sources 命令和子命令
+var sourcesPriorityCmd = &cobra.Command{
+	Use: "priority <source> <number>", Short: "设置来源优先级，数字越小越靠前", Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		priority, err := strconv.Atoi(args[1])
+		if err != nil || priority < 0 {
+			return fmt.Errorf("priority must be a non-negative integer")
+		}
+		if err := sources.NewSourceManager().SetPriority(args[0], priority); err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Source priority: %s = %d\n", args[0], priority)
+		fmt.Fprintln(cmd.OutOrStdout(), "Priority controls ordering; it does not change the default installation source.")
+		return nil
+	},
+}
+
+var sourcesCheckCmd = newSourcesCheckCommand(func(options sources.QueryOptions) (sources.CatalogResult, error) {
+	return sources.NewCatalog().Query(options)
+})
+
+func newSourcesCheckCommand(query func(sources.QueryOptions) (sources.CatalogResult, error)) *cobra.Command {
+	command := &cobra.Command{
+		Use: "check [source]", Short: "逐源检查当前平台的 Java 17 元数据可用性", Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			major, _ := cmd.Flags().GetInt("major")
+			if major < 1 {
+				return fmt.Errorf("major version must be positive")
+			}
+			options := sources.QueryOptions{Major: major, Refresh: true}
+			if len(args) > 0 {
+				options.Sources = []string{args[0]}
+			}
+			result, queryErr := query(options)
+			if len(result.Reports) > 0 {
+				if err := writeSourceReports(cmd.OutOrStdout(), result.Reports); err != nil {
+					return err
+				}
+			}
+			if queryErr != nil {
+				return queryErr
+			}
+			for _, report := range result.Reports {
+				if report.Status == "error" || report.Status == "stale" {
+					return fmt.Errorf("one or more sources could not provide fresh metadata; see source status above")
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Metadata check completed for Java %d. This checks the catalog, not archive download availability.\n", major)
+			return nil
+		},
+	}
+	command.Flags().Int("major", 17, "检查指定 Java 主版本的元数据")
+	return command
+}
+
+func listSourcesTo(out io.Writer) error {
+	manager := sources.NewSourceManager()
+	all, err := manager.LoadSources()
+	if err != nil {
+		return err
+	}
+	selected, err := manager.DefaultSource()
+	if err != nil {
+		return err
+	}
+	return writeSourcesTable(out, all, selected)
+}
+
+func writeSourcesTable(out io.Writer, all []sources.JavaSource, selected string) error {
+	ordered := append([]sources.JavaSource(nil), all...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Priority == ordered[j].Priority {
+			return ordered[i].Name < ordered[j].Name
+		}
+		return ordered[i].Priority < ordered[j].Priority
+	})
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "DEFAULT\tSOURCE\tENABLED\tPRIORITY\tDOWNLOAD\tDISTRIBUTION")
+	for _, source := range ordered {
+		mark, status := "-", "no"
+		if source.Name == selected {
+			mark = "*"
+		}
+		if source.Enabled {
+			status = "yes"
+		}
+		capability := "manual import"
+		if sources.IsSupportedSource(source) {
+			capability = "automatic"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n", mark, source.Name, status, source.Priority, capability, source.DisplayName)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintln(out, "\n* Default installation source. Run jvm sources check to test metadata access.\nPriority never authorizes switching to another vendor. Oracle requires manual import.")
+	return err
+}
+
+func writeSourceReports(out io.Writer, reports []sources.SourceReport) error {
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "SOURCE\tSTATUS\tVERSIONS\tDETAIL")
+	for _, report := range reports {
+		detail := strings.Join(strings.Fields(report.Error), " ")
+		if detail == "" && !report.CachedAt.IsZero() {
+			detail = "cached " + report.CachedAt.Format("2006-01-02 15:04:05Z07:00")
+		}
+		if detail == "" {
+			detail = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", report.Source, report.Status, report.Count, detail)
+	}
+	return w.Flush()
+}
+
 func init() {
-	// 添加子命令
-	sourcesCmd.AddCommand(sourcesListCmd)
-	sourcesCmd.AddCommand(sourcesEnableCmd)
-	sourcesCmd.AddCommand(sourcesDisableCmd)
+	sourcesCmd.AddCommand(sourcesListCmd, sourcesEnableCmd, sourcesDisableCmd, sourcesDefaultCmd, sourcesPriorityCmd, sourcesCheckCmd)
 }

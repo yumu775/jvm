@@ -1,26 +1,29 @@
 package sources
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
-
-	"github.com/fatih/color"
 )
 
-// SourceManager 管理不同的 Java 下载源
 type SourceManager struct {
-	client *http.Client
+	client     *http.Client
+	foojayBase string
+	githubBase string
 }
 
-// NewSourceManager 创建一个新的下载源管理器
 func NewSourceManager() *SourceManager {
-	return &SourceManager{
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}
+	return &SourceManager{client: &http.Client{Timeout: 30 * time.Second}}
 }
 
 // JavaSource 表示一个 Java 下载源
@@ -50,340 +53,228 @@ type JavaRelease struct {
 	Metadata     map[string]string `json:"metadata"`      // 额外信息
 }
 
-// GetDefaultSources 获取默认的下载源配置
+// GetDefaultSources 仅启用已经实现可靠元数据查询的源。
 func (sm *SourceManager) GetDefaultSources() []JavaSource {
 	return []JavaSource{
-		{
-			Name:        "adoptium",
-			DisplayName: "Eclipse Adoptium (Temurin)",
-			BaseURL:     "https://api.adoptium.net/v3",
-			APIType:     "adoptium",
-			Enabled:     true,
-			Priority:    1,
-			Metadata: map[string]string{
-				"description": "Eclipse Adoptium provides prebuilt OpenJDK binaries",
-				"website":     "https://adoptium.net/",
-			},
-		},
-		{
-			Name:        "corretto",
-			DisplayName: "Amazon Corretto",
-			BaseURL:     "https://corretto.aws",
-			APIType:     "corretto",
-			Enabled:     true,
-			Priority:    2,
-			Metadata: map[string]string{
-				"description": "Amazon Corretto is a no-cost, multiplatform distribution of OpenJDK",
-				"website":     "https://aws.amazon.com/corretto/",
-			},
-		},
-		{
-			Name:        "zulu",
-			DisplayName: "Azul Zulu",
-			BaseURL:     "https://api.azul.com/zulu/download/community/v1.0",
-			APIType:     "zulu",
-			Enabled:     true,
-			Priority:    3,
-			Metadata: map[string]string{
-				"description": "Azul Zulu builds of OpenJDK",
-				"website":     "https://www.azul.com/downloads/",
-			},
-		},
-		{
-			Name:        "oracle",
-			DisplayName: "Oracle JDK",
-			BaseURL:     "https://download.oracle.com/java",
-			APIType:     "oracle",
-			Enabled:     false, // 默认禁用，因为需要许可证
-			Priority:    4,
-			Metadata: map[string]string{
-				"description": "Oracle JDK (requires license for production use)",
-				"website":     "https://www.oracle.com/java/technologies/downloads/",
-				"license":     "Oracle Technology Network License Agreement",
-			},
-		},
-		{
-			Name:        "graalvm",
-			DisplayName: "GraalVM",
-			BaseURL:     "https://github.com/graalvm/graalvm-ce-builds/releases",
-			APIType:     "graalvm",
-			Enabled:     true,
-			Priority:    5,
-			Metadata: map[string]string{
-				"description": "GraalVM Community Edition",
-				"website":     "https://www.graalvm.org/",
-			},
-		},
+		{Name: "adoptium", DisplayName: "Eclipse Adoptium (Temurin)", BaseURL: "https://api.adoptium.net/v3", APIType: "adoptium", Enabled: true, Priority: 1},
+		{Name: "corretto", DisplayName: "Amazon Corretto", BaseURL: "https://api.foojay.io/disco/v3.0", APIType: "corretto", Enabled: true, Priority: 2},
+		{Name: "zulu", DisplayName: "Azul Zulu", BaseURL: "https://api.azul.com/metadata/v1/zulu", APIType: "zulu", Enabled: true, Priority: 3},
+		{Name: "oracle", DisplayName: "Oracle JDK (manual import)", APIType: "oracle", Priority: 4},
+		{Name: "graalvm", DisplayName: "GraalVM Community", BaseURL: "https://api.foojay.io/disco/v3.0", APIType: "graalvm", Enabled: true, Priority: 5},
 	}
 }
-
-// GetAvailableVersions 从所有启用的源获取可用版本
-func (sm *SourceManager) GetAvailableVersions(sources []JavaSource) ([]JavaRelease, error) {
-	var allReleases []JavaRelease
-	
-	for _, source := range sources {
-		if !source.Enabled {
-			continue
-		}
-		
-		color.Blue("Fetching versions from %s...", source.DisplayName)
-		
-		releases, err := sm.getVersionsFromSource(source)
-		if err != nil {
-			color.Yellow("Warning: failed to fetch from %s: %v", source.DisplayName, err)
-			continue
-		}
-		
-		// 为每个版本添加源信息
-		for i := range releases {
-			releases[i].Source = source.Name
-			releases[i].Vendor = source.DisplayName
-		}
-		
-		allReleases = append(allReleases, releases...)
-	}
-	
-	// 去重和排序
-	allReleases = sm.deduplicateReleases(allReleases)
-	
-	return allReleases, nil
-}
-
-// getVersionsFromSource 从特定源获取版本
-func (sm *SourceManager) getVersionsFromSource(source JavaSource) ([]JavaRelease, error) {
-	switch source.APIType {
-	case "adoptium":
-		return sm.getAdoptiumVersions(source)
-	case "corretto":
-		return sm.getCorrettoVersions(source)
-	case "zulu":
-		return sm.getZuluVersions(source)
-	case "oracle":
-		return sm.getOracleVersions(source)
-	case "graalvm":
-		return sm.getGraalVMVersions(source)
-	default:
-		return nil, fmt.Errorf("unsupported API type: %s", source.APIType)
-	}
-}
-
-// getAdoptiumVersions 获取 Adoptium 版本
-func (sm *SourceManager) getAdoptiumVersions(source JavaSource) ([]JavaRelease, error) {
-	osName, arch := getOSArch()
-	
-	// 获取可用的主版本号
-	majorVersions := []int{8, 11, 17, 21} // 常见的版本
-	var releases []JavaRelease
-	
-	for _, major := range majorVersions {
-		url := fmt.Sprintf("%s/binary/latest/%d/ga/%s/%s/jdk/hotspot/normal/eclipse",
-			source.BaseURL, major, osName, arch)
-		
-		// 这里简化处理，实际应该调用 API 获取详细信息
-		release := JavaRelease{
-			Version:      fmt.Sprintf("%d", major),
-			MajorVersion: major,
-			FullVersion:  fmt.Sprintf("%d.0.0", major),
-			DownloadURL:  url,
-			FileName:     sm.buildFileName(fmt.Sprintf("%d.0.0", major), osName, arch, "adoptium"),
-			LTS:          sm.isLTSVersion(major),
-			Source:       source.Name,
-			Vendor:       source.DisplayName,
-		}
-		
-		releases = append(releases, release)
-	}
-	
-	return releases, nil
-}
-
-// getCorrettoVersions 获取 Amazon Corretto 版本
-func (sm *SourceManager) getCorrettoVersions(source JavaSource) ([]JavaRelease, error) {
-	osName, arch := getOSArch()
-	
-	// Amazon Corretto 支持的版本
-	versions := map[int]string{
-		8:  "8.392.08.1",
-		11: "11.0.21.9.1",
-		17: "17.0.9.8.1",
-		21: "21.0.1.12.1",
-	}
-	
-	var releases []JavaRelease
-	
-	for major, version := range versions {
-		// 构建 Corretto 下载 URL
-		var ext string
-		switch osName {
-		case "windows":
-			ext = "zip"
-		case "linux":
-			ext = "tar.gz"
-		case "mac":
-			ext = "tar.gz"
-		}
-		
-		url := fmt.Sprintf("%s/downloads/latest/amazon-corretto-%s-%s-%s-jdk.%s",
-			source.BaseURL, version, arch, osName, ext)
-		
-		release := JavaRelease{
-			Version:      fmt.Sprintf("%d", major),
-			MajorVersion: major,
-			FullVersion:  version,
-			DownloadURL:  url,
-			FileName:     sm.buildFileName(version, osName, arch, "corretto"),
-			LTS:          sm.isLTSVersion(major),
-			Source:       source.Name,
-			Vendor:       source.DisplayName,
-		}
-		
-		releases = append(releases, release)
-	}
-	
-	return releases, nil
-}
-
-// getZuluVersions 获取 Azul Zulu 版本
-func (sm *SourceManager) getZuluVersions(source JavaSource) ([]JavaRelease, error) {
-	// 简化实现，实际应该调用 Azul API
-	osName, arch := getOSArch()
-	
-	versions := []struct {
-		major   int
-		version string
-	}{
-		{8, "8.0.392"},
-		{11, "11.0.21"},
-		{17, "17.0.9"},
-		{21, "21.0.1"},
-	}
-	
-	var releases []JavaRelease
-	
-	for _, v := range versions {
-		release := JavaRelease{
-			Version:      fmt.Sprintf("%d", v.major),
-			MajorVersion: v.major,
-			FullVersion:  v.version,
-			DownloadURL:  fmt.Sprintf("%s/bundles/latest/jdk%d.0.0/zulu%s-jdk%s-%s_%s", 
-				source.BaseURL, v.major, v.version, v.version, osName, arch),
-			FileName:     sm.buildFileName(v.version, osName, arch, "zulu"),
-			LTS:          sm.isLTSVersion(v.major),
-			Source:       source.Name,
-			Vendor:       source.DisplayName,
-		}
-		
-		releases = append(releases, release)
-	}
-	
-	return releases, nil
-}
-
-// getOracleVersions 获取 Oracle JDK 版本
-func (sm *SourceManager) getOracleVersions(source JavaSource) ([]JavaRelease, error) {
-	// Oracle JDK 需要特殊处理，通常需要登录和许可证同意
-	color.Yellow("Oracle JDK requires manual download due to license restrictions")
-	return []JavaRelease{}, nil
-}
-
-// getGraalVMVersions 获取 GraalVM 版本
-func (sm *SourceManager) getGraalVMVersions(source JavaSource) ([]JavaRelease, error) {
-	// 简化实现，实际应该调用 GitHub API
-	versions := []struct {
-		major   int
-		version string
-	}{
-		{11, "22.3.3"},
-		{17, "22.3.3"},
-		{21, "21.0.1"},
-	}
-	
-	var releases []JavaRelease
-	
-	for _, v := range versions {
-		release := JavaRelease{
-			Version:      fmt.Sprintf("graalvm-%d", v.major),
-			MajorVersion: v.major,
-			FullVersion:  v.version,
-			DownloadURL:  fmt.Sprintf("%s/download/vm-%s/graalvm-ce-java%d-%s", 
-				source.BaseURL, v.version, v.major, runtime.GOOS),
-			FileName:     sm.buildFileName(v.version, runtime.GOOS, runtime.GOARCH, "graalvm"),
-			LTS:          false, // GraalVM 有自己的发布周期
-			Source:       source.Name,
-			Vendor:       source.DisplayName,
-		}
-		
-		releases = append(releases, release)
-	}
-	
-	return releases, nil
-}
-
-// buildFileName 构建文件名
-func (sm *SourceManager) buildFileName(version, osName, arch, vendor string) string {
-	var ext string
-	switch osName {
-	case "windows":
-		ext = "zip"
-	default:
-		ext = "tar.gz"
-	}
-	
-	return fmt.Sprintf("%s-jdk-%s-%s-%s.%s", vendor, version, osName, arch, ext)
-}
-
-// isLTSVersion 判断是否为 LTS 版本
-func (sm *SourceManager) isLTSVersion(major int) bool {
-	ltsVersions := []int{8, 11, 17, 21, 25, 29, 33}
-	for _, lts := range ltsVersions {
-		if major == lts {
-			return true
-		}
-	}
-	return false
-}
-
-// deduplicateReleases 去除重复的版本
-func (sm *SourceManager) deduplicateReleases(releases []JavaRelease) []JavaRelease {
-	seen := make(map[string]JavaRelease)
-	
-	for _, release := range releases {
-		key := fmt.Sprintf("%d-%s", release.MajorVersion, release.Source)
-		if existing, exists := seen[key]; !exists || release.FullVersion > existing.FullVersion {
-			seen[key] = release
-		}
-	}
-	
+func (sm *SourceManager) GetAvailableVersions(all []JavaSource) ([]JavaRelease, error) {
 	var result []JavaRelease
-	for _, release := range seen {
-		result = append(result, release)
+	for _, s := range all {
+		if !s.Enabled {
+			continue
+		}
+		if !IsSupportedSource(s) {
+			return nil, fmt.Errorf("source %s is not supported for automatic downloads; import manually", s.Name)
+		}
+		releases, err := sm.getVersionsFromSource(s)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", s.Name, err)
+		}
+		result = append(result, releases...)
 	}
-	
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no releases available from enabled sources")
+	}
+	return sm.deduplicateReleases(result), nil
+}
+func (sm *SourceManager) getJSON(endpoint string, target interface{}) error {
+	resp, err := sm.client.Get(endpoint)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("metadata request returned HTTP %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(target)
+}
+
+type adoptiumAsset struct {
+	Version struct {
+		Semver string `json:"semver"`
+		Major  int    `json:"major"`
+	} `json:"version_data"`
+	Binaries []struct {
+		Package struct {
+			Name     string `json:"name"`
+			Link     string `json:"link"`
+			Checksum string `json:"checksum"`
+			Size     int64  `json:"size"`
+		} `json:"package"`
+	} `json:"binaries"`
+	ReleaseDate string `json:"timestamp"`
+}
+
+func (sm *SourceManager) getAdoptiumVersions(source JavaSource) ([]JavaRelease, error) {
+	return sm.fetchAdoptiumVersions(source, 0, true)
+}
+func (sm *SourceManager) fetchAdoptiumVersions(source JavaSource, requestedMajor int, all bool) ([]JavaRelease, error) {
+	var available struct {
+		Releases []int `json:"available_releases"`
+		LTS      []int `json:"available_lts_releases"`
+	}
+	if err := sm.getJSON(source.BaseURL+"/info/available_releases", &available); err != nil {
+		return nil, err
+	}
+	osName, arch := getOSArch()
+	lts := map[int]bool{}
+	for _, v := range available.LTS {
+		lts[v] = true
+	}
+	var result []JavaRelease
+	for _, major := range available.Releases {
+		if requestedMajor > 0 && major != requestedMajor {
+			continue
+		}
+		pageSize := 20
+		if !all {
+			pageSize = 1
+		}
+		for page := 0; ; page++ {
+			q := url.Values{"architecture": {arch}, "os": {osName}, "image_type": {"jdk"}, "jvm_impl": {"hotspot"}, "heap_size": {"normal"}, "vendor": {"eclipse"}, "page_size": {strconv.Itoa(pageSize)}, "page": {strconv.Itoa(page)}}
+			endpoint := fmt.Sprintf("%s/assets/feature_releases/%d/ga?%s", source.BaseURL, major, q.Encode())
+			var assets []adoptiumAsset
+			// 某些平台没有对应发行包，API 会返回 404。
+			resp, err := sm.client.Get(endpoint)
+			if err != nil {
+				return nil, err
+			}
+			if resp.StatusCode == http.StatusNotFound {
+				resp.Body.Close()
+				break
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return nil, fmt.Errorf("metadata request returned HTTP %d", resp.StatusCode)
+			}
+			err = json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&assets)
+			resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			for _, a := range assets {
+				for _, b := range a.Binaries {
+					p := b.Package
+					if !validReleaseMetadata(a.Version.Semver, a.Version.Major, major, p.Name, p.Checksum, p.Link, osName) || p.Size <= 0 {
+						return nil, fmt.Errorf("incomplete release metadata")
+					}
+					result = append(result, JavaRelease{Version: a.Version.Semver, FullVersion: a.Version.Semver, MajorVersion: a.Version.Major, DownloadURL: p.Link, FileName: p.Name, FileSize: p.Size, Checksum: p.Checksum, Source: source.Name, Vendor: source.DisplayName, LTS: lts[major], ReleaseDate: a.ReleaseDate, Metadata: map[string]string{"metadata_provider": "adoptium"}})
+				}
+			}
+			if !all || len(assets) < pageSize {
+				break
+			}
+			if page >= 999 {
+				return nil, fmt.Errorf("release pagination limit exceeded")
+			}
+		}
+	}
+	return result, nil
+}
+
+// validReleaseMetadata 拒绝安装器、越界文件名及不完整元数据。
+func validReleaseMetadata(version string, reportedMajor, requestedMajor int, name, checksum, link, osName string) bool {
+	if !regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)*(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`).MatchString(version) {
+		return false
+	}
+	majorText := strings.FieldsFunc(version, func(r rune) bool { return r == '.' || r == '+' })[0]
+	major, err := strconv.Atoi(majorText)
+	if err != nil || major != reportedMajor || major != requestedMajor {
+		return false
+	}
+	if filepath.Base(name) != name || strings.ContainsAny(name, `/\:`) {
+		return false
+	}
+	ext := ".tar.gz"
+	if osName == "windows" {
+		ext = ".zip"
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ext) {
+		return false
+	}
+	digest, err := hex.DecodeString(checksum)
+	if err != nil || len(digest) != 32 {
+		return false
+	}
+	u, err := url.Parse(link)
+	return err == nil && u.Scheme == "https" && u.Host != ""
+}
+
+// CompareVersions 按数字段比较版本，确保 17.0.10 排在 17.0.9 之后。
+func CompareVersions(a, b string) int {
+	split := func(s string) []string {
+		return strings.FieldsFunc(s, func(r rune) bool { return r == '.' || r == '+' || r == '_' || r == '-' })
+	}
+	x, y := split(a), split(b)
+	n := len(x)
+	if len(y) > n {
+		n = len(y)
+	}
+	for i := 0; i < n; i++ {
+		u, v := "0", "0"
+		if i < len(x) {
+			u = x[i]
+		}
+		if i < len(y) {
+			v = y[i]
+		}
+		nu, eu := strconv.Atoi(u)
+		nv, ev := strconv.Atoi(v)
+		if eu == nil && ev == nil {
+			if nu < nv {
+				return -1
+			}
+			if nu > nv {
+				return 1
+			}
+		} else {
+			if u < v {
+				return -1
+			}
+			if u > v {
+				return 1
+			}
+		}
+	}
+	return 0
+}
+func (sm *SourceManager) deduplicateReleases(releases []JavaRelease) []JavaRelease {
+	seen := map[string]bool{}
+	result := []JavaRelease{}
+	for _, r := range releases {
+		key := r.Source + "|" + r.FullVersion
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, r)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		c := CompareVersions(result[i].FullVersion, result[j].FullVersion)
+		if c != 0 {
+			return c > 0
+		}
+		return result[i].Source < result[j].Source
+	})
 	return result
 }
-
-// getOSArch 获取操作系统和架构信息
 func getOSArch() (string, string) {
-	osName := runtime.GOOS
-	arch := runtime.GOARCH
-	
-	switch osName {
-	case "darwin":
-		osName = "mac"
-	case "windows":
-		osName = "windows"
-	case "linux":
-		osName = "linux"
+	o, a := runtime.GOOS, runtime.GOARCH
+	if o == "darwin" {
+		o = "mac"
 	}
-	
-	switch arch {
+	switch a {
 	case "amd64":
-		arch = "x64"
+		a = "x64"
 	case "386":
-		arch = "x32"
+		a = "x86"
 	case "arm64":
-		arch = "aarch64"
+		a = "aarch64"
 	}
-	
-	return osName, arch
+	return o, a
 }

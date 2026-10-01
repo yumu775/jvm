@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -38,6 +37,15 @@ var importCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// 创建扫描器
 		javaScanner := scanner.NewScanner()
+		if len(args) == 1 && importFromPath == "" {
+			if info, err := os.Stat(args[0]); err == nil && info.IsDir() {
+				installation := javaScanner.AnalyzeJavaInstallation(args[0])
+				if installation == nil {
+					return fmt.Errorf("invalid Java installation: %s", args[0])
+				}
+				return performImport(installation)
+			}
+		}
 
 		var installations []scanner.JavaInstallation
 		var err error
@@ -68,9 +76,9 @@ var importCmd = &cobra.Command{
 		}
 
 		target := args[0]
-		
+
 		var targetInstallation *scanner.JavaInstallation
-		
+
 		// 尝试按版本号匹配
 		if majorVersion, err := strconv.Atoi(target); err == nil {
 			// 按主版本号匹配
@@ -89,7 +97,7 @@ var importCmd = &cobra.Command{
 				}
 			}
 		}
-		
+
 		// 如果没有找到版本匹配，尝试路径匹配
 		if targetInstallation == nil {
 			// 检查是否是路径
@@ -100,12 +108,12 @@ var importCmd = &cobra.Command{
 				}
 			}
 		}
-		
+
 		if targetInstallation == nil {
 			color.Red("Java installation not found: %s", target)
 			fmt.Println()
 			fmt.Println("Available installations:")
-			
+
 			if len(installations) == 0 {
 				fmt.Println("  No Java installations found")
 				fmt.Println("  Use 'jvm scan' to scan for installations")
@@ -114,26 +122,26 @@ var importCmd = &cobra.Command{
 					fmt.Printf("  %d. Java %s (%s)\n", i+1, installation.Version, installation.Path)
 				}
 			}
-			
-			return nil
+
+			return fmt.Errorf("Java installation not found: %s", target)
 		}
-		
+
 		// 导入找到的安装
 		color.Blue("Importing Java %s from %s...", targetInstallation.Version, targetInstallation.Path)
-		
+
 		versionsDir, err := config.GetVersionsDir()
 		if err != nil {
 			return fmt.Errorf("failed to get versions directory: %w", err)
 		}
-		
+
 		if err := javaScanner.ImportInstallation(*targetInstallation, versionsDir); err != nil {
 			return fmt.Errorf("failed to import Java installation: %w", err)
 		}
-		
+
 		color.Green("Successfully imported Java %s", targetInstallation.Version)
 		fmt.Printf("Installation path: %s\n", targetInstallation.Path)
 		fmt.Printf("Use 'jvm use %s' to switch to this version.\n", targetInstallation.Version)
-		
+
 		return nil
 	},
 }
@@ -160,6 +168,9 @@ func importAllVersions(installations []scanner.JavaInstallation) error {
 	}
 
 	color.Green("Import completed: %d/%d versions imported successfully", successCount, len(installations))
+	if successCount != len(installations) {
+		return fmt.Errorf("failed to import %d installation(s)", len(installations)-successCount)
+	}
 	return nil
 }
 
@@ -192,32 +203,7 @@ func showAvailableInstallations(installations []scanner.JavaInstallation) error 
 
 // performImport 执行实际的导入操作
 func performImport(installation *scanner.JavaInstallation) error {
-	// 这里重用现有的导入逻辑
-	// 创建符号链接或复制文件到 JVM 管理目录
-
-	// 获取 JVM 版本目录
-	versionsDir, err := config.GetVersionsDir()
-	if err != nil {
-		return err
-	}
-
-	// 创建版本目录名
-	versionDirName := "java-" + installation.Version
-	targetPath := filepath.Join(versionsDir, versionDirName)
-
-	// 检查是否已经存在
-	if _, err := os.Stat(targetPath); err == nil {
-		return fmt.Errorf("version %s is already imported", installation.Version)
-	}
-
-	// 创建符号链接（Windows 上可能需要管理员权限）
-	if err := os.Symlink(installation.Path, targetPath); err != nil {
-		// 如果符号链接失败，尝试复制（这里简化处理）
-		color.Yellow("Symbolic link failed, this version needs manual setup")
-		return fmt.Errorf("failed to create symbolic link: %w", err)
-	}
-
-	return nil
+	return scanner.NewScanner().ImportInstallation(*installation, "")
 }
 
 // init 函数初始化 import 命令的标志

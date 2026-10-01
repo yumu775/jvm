@@ -1,17 +1,18 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"jvm/internal/env"
 	"jvm/internal/project"
 	"jvm/internal/version"
 )
 
 var (
-	autoSwitch bool
+	autoSwitch  bool
 	forceCreate bool
 )
 
@@ -48,39 +49,42 @@ var projectInitCmd = &cobra.Command{
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		javaVersion := args[0]
-		
+
 		projectManager := project.NewManager()
-		
+
 		// 检查版本是否已安装
 		versionManager, err := version.NewManager()
 		if err != nil {
 			return fmt.Errorf("failed to initialize version manager: %w", err)
 		}
-		
+
 		if !versionManager.IsInstalled(javaVersion) {
+			if autoSwitch {
+				return fmt.Errorf("Java %s is not installed; install it before using --switch", javaVersion)
+			}
 			color.Yellow("Warning: Java version %s is not installed", javaVersion)
 			fmt.Printf("Use 'jvm install %s' to install this version.\n", javaVersion)
 		}
-		
+
 		// 创建项目配置
 		if err := projectManager.CreateProjectConfig(javaVersion); err != nil {
-			if forceCreate {
+			if forceCreate && errors.Is(err, os.ErrExist) {
 				// 强制创建，先更新现有配置
 				if updateErr := projectManager.UpdateProjectConfig(javaVersion); updateErr != nil {
-					return fmt.Errorf("failed to create/update project config: %w", err)
+					return fmt.Errorf("failed to update project config: %w", updateErr)
 				}
 			} else {
 				return fmt.Errorf("failed to create project config: %w", err)
 			}
 		}
-		
+
 		color.Green("Project configured to use Java %s", javaVersion)
-		
+
 		// 如果启用自动切换，立即切换版本
 		if autoSwitch && versionManager.IsInstalled(javaVersion) {
 			return switchToProjectVersion(javaVersion)
 		}
-		
+
 		return nil
 	},
 }
@@ -97,31 +101,30 @@ var projectSetCmd = &cobra.Command{
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		javaVersion := args[0]
-		
+
 		projectManager := project.NewManager()
-		
+
 		// 更新项目配置
 		if err := projectManager.UpdateProjectConfig(javaVersion); err != nil {
 			return fmt.Errorf("failed to update project config: %w", err)
 		}
-		
+
 		color.Green("Project updated to use Java %s", javaVersion)
-		
+
 		// 如果启用自动切换，立即切换版本
 		if autoSwitch {
 			versionManager, err := version.NewManager()
 			if err != nil {
 				return fmt.Errorf("failed to initialize version manager: %w", err)
 			}
-			
+
 			if versionManager.IsInstalled(javaVersion) {
 				return switchToProjectVersion(javaVersion)
 			} else {
-				color.Yellow("Java version %s is not installed", javaVersion)
-				fmt.Printf("Use 'jvm install %s' to install this version.\n", javaVersion)
+				return fmt.Errorf("project config saved, but Java version %s is not installed; cannot switch", javaVersion)
 			}
 		}
-		
+
 		return nil
 	},
 }
@@ -148,13 +151,13 @@ var projectUseCmd = &cobra.Command{
 然后切换到配置文件中指定的 Java 版本。`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		projectManager := project.NewManager()
-		
+
 		// 查找项目配置
 		config, err := projectManager.AutoSwitchToProjectVersion()
 		if err != nil {
 			return fmt.Errorf("failed to find project configuration: %w", err)
 		}
-		
+
 		// 切换到项目版本
 		return switchToProjectVersion(config.JavaVersion)
 	},
@@ -163,21 +166,21 @@ var projectUseCmd = &cobra.Command{
 // showProjectInfo 显示项目信息
 func showProjectInfo() error {
 	projectManager := project.NewManager()
-	
+
 	color.Blue("=== Project Configuration ===")
 	fmt.Println()
-	
+
 	// 获取项目信息
 	info, err := projectManager.GetProjectInfo()
 	if err != nil {
 		return fmt.Errorf("failed to get project info: %w", err)
 	}
-	
+
 	// 显示基本信息
 	color.Green("Current Directory:")
 	fmt.Printf("  %s\n", info["current_directory"])
 	fmt.Println()
-	
+
 	color.Green("Project Configuration:")
 	if info["project_config"] == "Not found" {
 		color.Yellow("  No project configuration found")
@@ -186,7 +189,7 @@ func showProjectInfo() error {
 		fmt.Printf("  Config file: %s\n", info["project_config"])
 		fmt.Printf("  Java version: %s\n", info["java_version"])
 		fmt.Printf("  Location: %s\n", info["config_location"])
-		
+
 		// 检查版本是否已安装
 		versionManager, err := version.NewManager()
 		if err == nil {
@@ -198,44 +201,13 @@ func showProjectInfo() error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
 // switchToProjectVersion 切换到指定的项目版本
 func switchToProjectVersion(javaVersion string) error {
-	// 创建版本管理器
-	versionManager, err := version.NewManager()
-	if err != nil {
-		return fmt.Errorf("failed to initialize version manager: %w", err)
-	}
-	
-	// 检查版本是否已安装
-	if !versionManager.IsInstalled(javaVersion) {
-		color.Red("Java version %s is not installed", javaVersion)
-		fmt.Printf("Use 'jvm install %s' to install this version.\n", javaVersion)
-		return nil
-	}
-	
-	// 切换版本
-	if err := versionManager.SetCurrent(javaVersion); err != nil {
-		return fmt.Errorf("failed to set current version: %w", err)
-	}
-	
-	// 获取版本路径
-	versionPath, err := versionManager.GetVersionPath(javaVersion)
-	if err != nil {
-		return fmt.Errorf("failed to get version path: %w", err)
-	}
-	
-	// 设置环境变量
-	envManager := env.NewManager()
-	if err := envManager.SetJavaEnvironment(versionPath, true); err != nil {
-		color.Yellow("Warning: failed to set environment variables: %v", err)
-	}
-	
-	color.Green("Switched to Java %s (project version)", javaVersion)
-	return nil
+	return selectJavaVersion(javaVersion)
 }
 
 // init 函数初始化 project 命令和子命令
@@ -245,10 +217,10 @@ func init() {
 	projectCmd.AddCommand(projectSetCmd)
 	projectCmd.AddCommand(projectGetCmd)
 	projectCmd.AddCommand(projectUseCmd)
-	
+
 	// 添加标志
 	projectInitCmd.Flags().BoolVar(&autoSwitch, "switch", false, "创建配置后自动切换到指定版本")
 	projectInitCmd.Flags().BoolVar(&forceCreate, "force", false, "强制创建，覆盖现有配置")
-	
+
 	projectSetCmd.Flags().BoolVar(&autoSwitch, "switch", false, "设置配置后自动切换到指定版本")
 }

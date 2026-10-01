@@ -2,108 +2,104 @@ package cmd
 
 import (
 	"fmt"
-	"path/filepath"
+	"os"
 
-	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"jvm/internal/env"
 	"jvm/internal/version"
 )
 
-// useCmd 定义了 "jvm use" 命令
-// 这个命令用于切换到指定的 Java 版本
-var (
-	tempOnly bool
-	persistent bool
-)
-
+var tempOnly, persistent bool
+var useShell string
 var useCmd = &cobra.Command{
-	Use:   "use <version>",
-	Short: "切换到指定的 Java 版本",
-	Long: `切换到指定的 Java 版本。
-
-这个命令会：
-1. 验证指定的版本是否已安装
-2. 设置该版本为当前激活版本
-3. 自动更新环境变量和 shell 配置
-
-示例：
-  jvm use 17                    # 切换到 Java 17 并更新 shell 配置
-  jvm use 11.0.19 --temp       # 仅在当前会话中切换
-  jvm use 17 --persistent      # 强制更新 shell 配置文件`,
-	// Args 字段定义了命令参数的验证规则
-	// cobra.ExactArgs(1) 表示这个命令需要恰好一个参数
+	Use: "use <version>", Short: "选择默认 Java 版本；已有终端需执行激活脚本",
+	Long: `选择默认 Java 并持久化环境。已有终端和 IDE 不会被子进程直接修改。
+PowerShell 激活：jvm env --shell powershell | Out-String | Invoke-Expression
+Bash/Zsh 激活：eval "$(jvm env --shell bash)"
+临时选择：jvm use 17 --temp --shell powershell | Out-String | Invoke-Expression
+CMD：jvm env --shell cmd > "%TEMP%\jvm-activate.cmd" && call "%TEMP%\jvm-activate.cmd"`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// 获取用户指定的版本号
-		targetVersion := args[0]
-		
-		// 创建版本管理器实例
-		manager, err := version.NewManager()
-		if err != nil {
-			return fmt.Errorf("failed to initialize version manager: %w", err)
+		if useShell != "" && !tempOnly {
+			return fmt.Errorf("--shell requires --temp; use jvm env --shell <shell> for activation")
 		}
-		
-		// 检查版本是否已安装
-		if !manager.IsInstalled(targetVersion) {
-			color.Red("Java version %s is not installed.", targetVersion)
-			fmt.Printf("Use 'jvm install %s' to install this version.\n", targetVersion)
-			return nil
-		}
-		
-		// 切换到指定版本
-		if err := manager.SetCurrent(targetVersion); err != nil {
-			return fmt.Errorf("failed to set current version: %w", err)
-		}
-		
-		// 获取版本路径
-		versionPath, err := manager.GetVersionPath(targetVersion)
-		if err != nil {
-			return fmt.Errorf("failed to get version path: %w", err)
-		}
-
-		// 显示成功信息
-		color.Green("Now using Java %s", targetVersion)
-		fmt.Printf("Installation path: %s\n", versionPath)
-
-		// 创建环境变量管理器
-		envManager := env.NewManager()
-
-		// 设置环境变量
 		if tempOnly {
-			// 仅设置临时环境变量
-			if err := envManager.SetJavaEnvironment(versionPath, true); err != nil {
-				color.Yellow("Warning: failed to set temporary environment variables: %v", err)
-			}
-		} else {
-			// 设置临时环境变量（立即生效）
-			if err := envManager.SetJavaEnvironment(versionPath, true); err != nil {
-				color.Yellow("Warning: failed to set temporary environment variables: %v", err)
-			}
-
-			// 如果用户明确要求持久化，或者默认行为
-			if persistent || !tempOnly {
-				fmt.Println()
-				color.Blue("Updating shell configuration for persistent environment variables...")
-				if err := envManager.SetJavaEnvironment(versionPath, false); err != nil {
-					color.Yellow("Warning: failed to update shell configuration: %v", err)
-					fmt.Println()
-					color.Yellow("You can manually set environment variables:")
-					color.Yellow("  JAVA_HOME=%s", versionPath)
-					color.Yellow("  PATH=%s:$PATH", filepath.Join(versionPath, "bin"))
-				}
-			}
+			return printVersionActivation(cmd, args[0], useShell)
 		}
-		
-		return nil
+		return selectJavaVersion(args[0])
 	},
 }
 
-// init 函数初始化 use 命令的标志
-func init() {
-	// 添加仅临时设置标志
-	useCmd.Flags().BoolVarP(&tempOnly, "temp", "t", false, "仅在当前会话中设置环境变量")
+// shellInitCmd 输出由用户显式加载的 shell 集成，不修改启动脚本。
+var shellInitCmd = &cobra.Command{
+	Use: "init powershell", Short: "输出 PowerShell 集成函数，使普通 use 自动应用到当前终端",
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if args[0] != "powershell" {
+			return fmt.Errorf("automatic integration currently supports powershell; other shells can execute jvm env --shell output")
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprint(cmd.OutOrStdout(), env.PowerShellIntegration(executable))
+		return err
+	},
+}
 
-	// 添加强制持久化标志
-	useCmd.Flags().BoolVarP(&persistent, "persistent", "p", false, "强制更新 shell 配置文件")
+func printVersionActivation(cmd *cobra.Command, target, shell string) error {
+	if shell == "" {
+		return fmt.Errorf("--temp requires --shell; execute the emitted script in your shell")
+	}
+	manager, err := version.NewManager()
+	if err != nil {
+		return err
+	}
+	home, err := manager.GetVersionPath(target)
+	if err != nil {
+		return err
+	}
+	script, err := env.ActivationScript(shell, home, os.Getenv("PATH"), os.Getenv("JAVA_HOME"))
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprint(cmd.OutOrStdout(), script)
+	return err
+}
+
+func selectJavaVersion(target string) error {
+	manager, err := version.NewManager()
+	if err != nil {
+		return err
+	}
+	home, err := manager.GetVersionPath(target)
+	if err != nil {
+		return err
+	}
+	if err := env.NewManager().SetJavaEnvironment(home, false); err != nil {
+		return err
+	}
+	if err := manager.SetCurrent(target); err != nil {
+		return fmt.Errorf("environment was saved, but selected-version metadata could not be saved: %w", err)
+	}
+	fmt.Printf("Default Java: %s\nJAVA_HOME: %s\n", target, home)
+	printActivationInstructions()
+	return nil
+}
+
+func printActivationInstructions() {
+	fmt.Println("Persistent environment saved. Existing terminals and IDEs keep their inherited environment.")
+	fmt.Println("PowerShell: jvm env --shell powershell | Out-String | Invoke-Expression")
+	cmdHint := `CMD: jvm env --shell cmd > "%TEMP%\jvm-activate.cmd" && call "%TEMP%\jvm-activate.cmd"`
+	fmt.Println(cmdHint)
+	fmt.Println(`Bash/Zsh: eval "$(jvm env --shell bash)"`)
+	fmt.Println("Restart the IDE from an activated terminal, or explicitly select JAVA_HOME in its Gradle JDK settings.")
+	fmt.Println("A Java shim in Windows system PATH can still override user PATH; jvm env diagnoses this, and shell activation prepends the selected JDK.")
+}
+
+func init() {
+	useCmd.Flags().BoolVarP(&tempOnly, "temp", "t", false, "输出临时激活脚本，不保存默认版本")
+	useCmd.Flags().BoolVarP(&persistent, "persistent", "p", false, "持久化默认版本（默认行为）")
+	useCmd.Flags().StringVar(&useShell, "shell", "", "临时激活脚本格式")
+	useCmd.MarkFlagsMutuallyExclusive("temp", "persistent")
 }

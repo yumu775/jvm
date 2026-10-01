@@ -1,409 +1,390 @@
 package env
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"github.com/fatih/color"
+	"unicode/utf8"
 )
 
-// Manager 负责管理环境变量和 shell 集成
+// Manager 管理持久环境；当前终端必须显式执行激活脚本。
 type Manager struct{}
 
-// NewManager 创建一个新的环境变量管理器实例
-func NewManager() *Manager {
-	return &Manager{}
-}
+func NewManager() *Manager { return &Manager{} }
 
-// ShellInfo 包含 shell 的信息
-type ShellInfo struct {
-	Name        string // shell 名称，如 "bash", "zsh", "powershell"
-	ConfigFile  string // 配置文件路径
-	SetCommand  string // 设置环境变量的命令格式
-	ExportCmd   string // 导出命令格式
-}
+type ShellInfo struct{ Name, ConfigFile, SetCommand, ExportCmd string }
 
-// DetectShell 检测当前使用的 shell
 func (m *Manager) DetectShell() (*ShellInfo, error) {
-	switch runtime.GOOS {
-	case "windows":
-		return m.detectWindowsShell()
-	case "darwin", "linux":
-		return m.detectUnixShell()
-	default:
-		return nil, fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	if runtime.GOOS == "windows" {
+		return &ShellInfo{Name: "windows (specify --shell for activation)"}, nil
 	}
-}
-
-// detectWindowsShell 检测 Windows 上的 shell
-func (m *Manager) detectWindowsShell() (*ShellInfo, error) {
-	// 检查是否在 PowerShell 中
-	if psModulePath := os.Getenv("PSModulePath"); psModulePath != "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		
-		// 检查 PowerShell 版本
-		profilePath := filepath.Join(homeDir, "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1")
-		if _, err := os.Stat(profilePath); os.IsNotExist(err) {
-			// 尝试 Windows PowerShell 5.x 路径
-			profilePath = filepath.Join(homeDir, "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1")
-		}
-		
-		return &ShellInfo{
-			Name:       "powershell",
-			ConfigFile: profilePath,
-			SetCommand: "$env:%s = \"%s\"",
-			ExportCmd:  "$env:%s = \"%s\"",
-		}, nil
-	}
-	
-	// 默认使用 Command Prompt
-	return &ShellInfo{
-		Name:       "cmd",
-		ConfigFile: "", // CMD 没有持久化配置文件
-		SetCommand: "set %s=%s",
-		ExportCmd:  "set %s=%s",
-	}, nil
-}
-
-// detectUnixShell 检测 Unix-like 系统上的 shell
-func (m *Manager) detectUnixShell() (*ShellInfo, error) {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash" // 默认使用 bash
-	}
-	
-	homeDir, err := os.UserHomeDir()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	
-	shellName := filepath.Base(shell)
-	var configFile string
-	
-	switch shellName {
+	name := filepath.Base(os.Getenv("SHELL"))
+	if name == "." || name == "" {
+		name = "bash"
+	}
+	config := filepath.Join(home, ".profile")
+	switch name {
 	case "bash":
-		// 优先使用 .bashrc，如果不存在则使用 .bash_profile
-		configFile = filepath.Join(homeDir, ".bashrc")
-		if _, err := os.Stat(configFile); os.IsNotExist(err) {
-			configFile = filepath.Join(homeDir, ".bash_profile")
-		}
+		config = filepath.Join(home, ".bashrc")
 	case "zsh":
-		configFile = filepath.Join(homeDir, ".zshrc")
+		config = filepath.Join(home, ".zshrc")
 	case "fish":
-		configFile = filepath.Join(homeDir, ".config", "fish", "config.fish")
-	default:
-		// 对于未知 shell，尝试使用 .profile
-		configFile = filepath.Join(homeDir, ".profile")
+		config = filepath.Join(home, ".config", "fish", "config.fish")
 	}
-	
-	return &ShellInfo{
-		Name:       shellName,
-		ConfigFile: configFile,
-		SetCommand: "export %s=\"%s\"",
-		ExportCmd:  "export %s=\"%s\"",
-	}, nil
+	return &ShellInfo{Name: name, ConfigFile: config}, nil
 }
 
-// SetJavaEnvironment 设置 Java 环境变量
-func (m *Manager) SetJavaEnvironment(javaHome string, temporary bool) error {
-	if temporary {
-		return m.setTemporaryEnvironment(javaHome)
+func ValidateJavaHome(home string) (string, error) {
+	absolute, err := filepath.Abs(home)
+	if err != nil {
+		return "", err
 	}
-	return m.setPersistentEnvironment(javaHome)
-}
-
-// setTemporaryEnvironment 设置临时环境变量（仅当前会话）
-func (m *Manager) setTemporaryEnvironment(javaHome string) error {
-	// 设置 JAVA_HOME
-	if err := os.Setenv("JAVA_HOME", javaHome); err != nil {
-		return fmt.Errorf("failed to set JAVA_HOME: %w", err)
+	if strings.ContainsAny(absolute, "\r\n\x00") {
+		return "", fmt.Errorf("Java path contains control characters")
 	}
-	
-	// 更新 PATH
-	javaBin := filepath.Join(javaHome, "bin")
-	currentPath := os.Getenv("PATH")
-	
-	// 移除现有的 Java 路径
-	newPath := m.removeJavaFromPath(currentPath)
-	
-	// 添加新的 Java 路径到开头
-	separator := ":"
+	if err := validatePathEntry(absolute, runtime.GOOS == "windows"); err != nil {
+		return "", err
+	}
+	name := "java"
 	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	info, err := os.Stat(filepath.Join(absolute, "bin", name))
+	if err != nil {
+		return "", fmt.Errorf("invalid Java home %q: %w", absolute, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("Java executable is a directory")
+	}
+	return absolute, nil
+}
+
+// 路径列表无法转义分隔符，必须在写入环境前拒绝这类目录。
+func validatePathEntry(path string, windows bool) error {
+	separator := ":"
+	if windows {
 		separator = ";"
 	}
-	
-	newPath = javaBin + separator + newPath
-	
-	if err := os.Setenv("PATH", newPath); err != nil {
-		return fmt.Errorf("failed to set PATH: %w", err)
+	if strings.ContainsAny(path, separator+"\r\n\x00") {
+		return fmt.Errorf("path cannot be represented as a PATH entry: %q", path)
 	}
-	
-	color.Green("✓ Temporary environment variables set for current session")
-	color.Blue("  JAVA_HOME = %s", javaHome)
-	color.Blue("  PATH updated to include %s", javaBin)
-	
 	return nil
 }
 
-// setPersistentEnvironment 设置持久化环境变量
-func (m *Manager) setPersistentEnvironment(javaHome string) error {
+// UpdatePath 只替换明确管理的目录，不按 java 字样删除其他工具。
+func UpdatePath(value, add, old string, windows bool) string {
+	sep := ":"
+	if windows {
+		sep = ";"
+	}
+	equal := func(a, b string) bool {
+		a = strings.TrimRight(strings.Trim(a, " \""), "/\\")
+		b = strings.TrimRight(strings.Trim(b, " \""), "/\\")
+		if windows {
+			return strings.EqualFold(strings.ReplaceAll(a, "/", "\\"), strings.ReplaceAll(b, "/", "\\"))
+		}
+		return a == b
+	}
+	parts := []string{}
+	if add != "" {
+		parts = append(parts, add)
+	}
+	for _, p := range strings.Split(value, sep) {
+		if p == "" {
+			continue
+		}
+		if (add != "" && equal(p, add)) || (old != "" && equal(p, old)) {
+			continue
+		}
+		parts = append(parts, p)
+	}
+	return strings.Join(parts, sep)
+}
+
+func quotePS(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+func quoteSH(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+func quoteFish(s string) string {
+	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, "\\", "\\\\"), "'", "\\'") + "'"
+}
+
+// PowerShellIntegration 只定义函数；用户明确执行输出后才启用自动激活。
+func PowerShellIntegration(executable string) string {
+	program := quotePS(executable)
+	return "function global:jvm {\n" +
+		"  $jvmArguments = @($args)\n" +
+		"  & " + program + " @jvmArguments\n" +
+		"  $jvmStatus = $LASTEXITCODE\n" +
+		"  $jvmTemporary = @($jvmArguments | Where-Object { $_ -match '^(--temp|-t)(=true)?$' }).Count -gt 0\n" +
+		"  $jvmApply = $jvmArguments.Count -gt 0 -and ($jvmArguments[0] -eq 'use' -or $jvmArguments[0] -eq 'set-env' -or ($jvmArguments.Count -gt 1 -and $jvmArguments[0] -eq 'project' -and $jvmArguments[1] -eq 'use'))\n" +
+		"  if ($jvmStatus -eq 0 -and $jvmApply -and -not $jvmTemporary -and $jvmArguments -notcontains '--help' -and $jvmArguments -notcontains '-h' -and $jvmArguments -notcontains 'list') {\n" +
+		"    $jvmScript = & " + program + " env --shell powershell | Out-String\n" +
+		"    $jvmStatus = $LASTEXITCODE\n" +
+		"    if ($jvmStatus -eq 0) { Invoke-Expression $jvmScript }\n" +
+		"  }\n" +
+		"  $global:LASTEXITCODE = $jvmStatus\n" +
+		"}\n"
+}
+
+// ActivationScript 返回纯脚本，不写入配置，也不修改当前进程环境。
+func ActivationScript(shell, home, path, oldHome string) (string, error) {
+	if strings.ContainsAny(home+path+oldHome, "\r\n\x00") {
+		return "", fmt.Errorf("environment contains unsupported control characters")
+	}
+	windows := shell == "cmd" || shell == "powershell"
+	if err := validatePathEntry(home, windows); err != nil {
+		return "", err
+	}
+	old := ""
+	if oldHome != "" {
+		old = filepath.Join(oldHome, "bin")
+	}
+	if windows {
+		path = UpdatePath(path, "", `%JAVA_HOME%\bin`, true)
+	}
+	updated := UpdatePath(path, filepath.Join(home, "bin"), old, windows)
+	switch shell {
+	case "powershell":
+		return "$env:JAVA_HOME = " + quotePS(home) + "\n$env:PATH = " + quotePS(updated) + "\n", nil
+	case "cmd":
+		// 批处理百分号/延迟展开会再次解释路径，拒绝无法安全表达的值。
+		if strings.ContainsAny(home+updated, "%!\"") {
+			return "", fmt.Errorf("CMD activation cannot safely represent percent, exclamation mark or quote; use PowerShell")
+		}
+		return "@set \"JAVA_HOME=" + home + "\"\r\n@set \"PATH=" + updated + "\"\r\n", nil
+	case "bash", "zsh", "sh":
+		return "export JAVA_HOME=" + quoteSH(home) + "\nexport PATH=" + quoteSH(updated) + "\n", nil
+	case "fish":
+		parts := strings.Split(updated, ":")
+		for i := range parts {
+			parts[i] = quoteFish(parts[i])
+		}
+		return "set -gx JAVA_HOME " + quoteFish(home) + "\nset -gx PATH " + strings.Join(parts, " ") + "\n", nil
+	default:
+		return "", fmt.Errorf("unsupported shell %q; choose powershell, cmd, bash, zsh, sh or fish", shell)
+	}
+}
+
+func (m *Manager) SetJavaEnvironment(home string, temporary bool) error {
+	if temporary {
+		return fmt.Errorf("a child process cannot change its parent shell; execute jvm env --shell <shell> --java-home <path> output in your shell")
+	}
+	home, err := ValidateJavaHome(home)
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return persistWindowsJava(home)
+	}
 	shell, err := m.DetectShell()
 	if err != nil {
-		return fmt.Errorf("failed to detect shell: %w", err)
+		return err
 	}
-	
-	color.Blue("Detected shell: %s", shell.Name)
-	
-	switch shell.Name {
-	case "powershell":
-		return m.setPowerShellEnvironment(shell, javaHome)
-	case "cmd":
-		return m.setCmdEnvironment(javaHome)
-	case "bash", "zsh":
-		return m.setUnixShellEnvironment(shell, javaHome)
-	case "fish":
-		return m.setFishEnvironment(shell, javaHome)
-	default:
-		return m.setUnixShellEnvironment(shell, javaHome)
+	var body string
+	if shell.Name == "fish" {
+		body = "set -gx JAVA_HOME " + quoteFish(home) + "\nset -gx PATH " + quoteFish(filepath.Join(home, "bin")) + " $PATH"
+	} else {
+		body = "export JAVA_HOME=" + quoteSH(home) + "\nexport PATH=" + quoteSH(filepath.Join(home, "bin")) + ":\"$PATH\""
 	}
+	return WriteProfileBlock(shell.ConfigFile, "JVM Java Version Manager", body)
 }
 
-// setPowerShellEnvironment 设置 PowerShell 环境变量
-func (m *Manager) setPowerShellEnvironment(shell *ShellInfo, javaHome string) error {
-	// 确保 PowerShell profile 目录存在
-	profileDir := filepath.Dir(shell.ConfigFile)
-	if err := os.MkdirAll(profileDir, 0755); err != nil {
-		return fmt.Errorf("failed to create PowerShell profile directory: %w", err)
+// WriteProfileBlock 保留其他配置，遇到无法读取或损坏的标记时拒绝覆盖。
+func WriteProfileBlock(path, marker, body string) error {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
 	}
-	
-	// 读取现有的 profile 内容
-	var existingContent []string
-	if content, err := os.ReadFile(shell.ConfigFile); err == nil {
-		existingContent = strings.Split(string(content), "\n")
+	content, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	
-	// 移除现有的 JVM 相关设置
-	var newContent []string
-	inJVMBlock := false
-	
-	for _, line := range existingContent {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "# JVM Java Version Manager - START" {
-			inJVMBlock = true
-			continue
-		}
-		if trimmed == "# JVM Java Version Manager - END" {
-			inJVMBlock = false
-			continue
-		}
-		if !inJVMBlock {
-			newContent = append(newContent, line)
-		}
+	if os.IsNotExist(err) && body == "" {
+		return nil
 	}
-	
-	// 添加新的 JVM 设置
-	javaBin := filepath.Join(javaHome, "bin")
-	jvmBlock := []string{
-		"",
-		"# JVM Java Version Manager - START",
-		fmt.Sprintf("$env:JAVA_HOME = \"%s\"", javaHome),
-		fmt.Sprintf("$env:PATH = \"%s;\" + ($env:PATH -replace \"[^;]*java[^;]*;?\", \"\")", javaBin),
-		"# JVM Java Version Manager - END",
-		"",
+	result, err := renderProfileBlock(content, marker, body)
+	if err != nil {
+		return fmt.Errorf("profile %s: %w", path, err)
 	}
-	
-	newContent = append(newContent, jvmBlock...)
-	
-	// 写入文件
-	finalContent := strings.Join(newContent, "\n")
-	if err := os.WriteFile(shell.ConfigFile, []byte(finalContent), 0644); err != nil {
-		return fmt.Errorf("failed to write PowerShell profile: %w", err)
-	}
-	
-	color.Green("✓ PowerShell profile updated: %s", shell.ConfigFile)
-	color.Yellow("Please restart PowerShell or run: . $PROFILE")
-	
-	return nil
+	return writeProfileContent(path, result)
 }
 
-// setCmdEnvironment 设置 Windows CMD 环境变量
-func (m *Manager) setCmdEnvironment(javaHome string) error {
-	color.Yellow("CMD does not support persistent environment variables through configuration files.")
-	color.Yellow("Please set environment variables manually through System Properties or use PowerShell.")
-	color.Yellow("")
-	color.Yellow("Manual steps:")
-	color.Yellow("1. Open System Properties > Advanced > Environment Variables")
-	color.Yellow("2. Set JAVA_HOME = %s", javaHome)
-	color.Yellow("3. Add %s to PATH", filepath.Join(javaHome, "bin"))
-	
-	return nil
-}
-
-// setUnixShellEnvironment 设置 Unix shell 环境变量
-func (m *Manager) setUnixShellEnvironment(shell *ShellInfo, javaHome string) error {
-	// 确保配置文件目录存在
-	configDir := filepath.Dir(shell.ConfigFile)
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-	
-	// 读取现有配置
-	var existingContent []string
-	if content, err := os.ReadFile(shell.ConfigFile); err == nil {
-		existingContent = strings.Split(string(content), "\n")
-	}
-	
-	// 移除现有的 JVM 相关设置
-	var newContent []string
-	inJVMBlock := false
-	
-	for _, line := range existingContent {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "# JVM Java Version Manager - START" {
-			inJVMBlock = true
-			continue
-		}
-		if trimmed == "# JVM Java Version Manager - END" {
-			inJVMBlock = false
-			continue
-		}
-		if !inJVMBlock {
-			newContent = append(newContent, line)
-		}
-	}
-	
-	// 添加新的 JVM 设置
-	javaBin := filepath.Join(javaHome, "bin")
-	jvmBlock := []string{
-		"",
-		"# JVM Java Version Manager - START",
-		fmt.Sprintf("export JAVA_HOME=\"%s\"", javaHome),
-		fmt.Sprintf("export PATH=\"%s:$PATH\"", javaBin),
-		"# JVM Java Version Manager - END",
-		"",
-	}
-	
-	newContent = append(newContent, jvmBlock...)
-	
-	// 写入文件
-	finalContent := strings.Join(newContent, "\n")
-	if err := os.WriteFile(shell.ConfigFile, []byte(finalContent), 0644); err != nil {
-		return fmt.Errorf("failed to write shell config: %w", err)
-	}
-	
-	color.Green("✓ Shell configuration updated: %s", shell.ConfigFile)
-	color.Yellow("Please restart your terminal or run: source %s", shell.ConfigFile)
-	
-	return nil
-}
-
-// setFishEnvironment 设置 Fish shell 环境变量
-func (m *Manager) setFishEnvironment(shell *ShellInfo, javaHome string) error {
-	// Fish shell 使用不同的语法
-	configDir := filepath.Dir(shell.ConfigFile)
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("failed to create fish config directory: %w", err)
-	}
-	
-	var existingContent []string
-	if content, err := os.ReadFile(shell.ConfigFile); err == nil {
-		existingContent = strings.Split(string(content), "\n")
-	}
-	
-	// 移除现有的 JVM 相关设置
-	var newContent []string
-	inJVMBlock := false
-	
-	for _, line := range existingContent {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "# JVM Java Version Manager - START" {
-			inJVMBlock = true
-			continue
-		}
-		if trimmed == "# JVM Java Version Manager - END" {
-			inJVMBlock = false
-			continue
-		}
-		if !inJVMBlock {
-			newContent = append(newContent, line)
-		}
-	}
-	
-	// 添加新的 JVM 设置（Fish 语法）
-	javaBin := filepath.Join(javaHome, "bin")
-	jvmBlock := []string{
-		"",
-		"# JVM Java Version Manager - START",
-		fmt.Sprintf("set -gx JAVA_HOME \"%s\"", javaHome),
-		fmt.Sprintf("set -gx PATH \"%s\" $PATH", javaBin),
-		"# JVM Java Version Manager - END",
-		"",
-	}
-	
-	newContent = append(newContent, jvmBlock...)
-	
-	// 写入文件
-	finalContent := strings.Join(newContent, "\n")
-	if err := os.WriteFile(shell.ConfigFile, []byte(finalContent), 0644); err != nil {
-		return fmt.Errorf("failed to write fish config: %w", err)
-	}
-	
-	color.Green("✓ Fish shell configuration updated: %s", shell.ConfigFile)
-	color.Yellow("Please restart your terminal or run: source %s", shell.ConfigFile)
-	
-	return nil
-}
-
-// removeJavaFromPath 从 PATH 中移除现有的 Java 路径
-func (m *Manager) removeJavaFromPath(path string) string {
-	separator := ":"
-	if runtime.GOOS == "windows" {
-		separator = ";"
-	}
-	
-	paths := strings.Split(path, separator)
-	var newPaths []string
-	
-	for _, p := range paths {
-		// 跳过包含 java 的路径（简单的启发式方法）
-		if !strings.Contains(strings.ToLower(p), "java") {
-			newPaths = append(newPaths, p)
-		}
-	}
-	
-	return strings.Join(newPaths, separator)
-}
-
-// GetCurrentJavaInfo 获取当前 Java 环境信息
-func (m *Manager) GetCurrentJavaInfo() (map[string]string, error) {
-	info := make(map[string]string)
-	
-	// 获取 JAVA_HOME
-	if javaHome := os.Getenv("JAVA_HOME"); javaHome != "" {
-		info["JAVA_HOME"] = javaHome
-	}
-	
-	// 获取 PATH 中的 Java
-	if path := os.Getenv("PATH"); path != "" {
-		separator := ":"
-		if runtime.GOOS == "windows" {
-			separator = ";"
-		}
-		
-		paths := strings.Split(path, separator)
-		for _, p := range paths {
-			if strings.Contains(strings.ToLower(p), "java") && strings.Contains(p, "bin") {
-				info["JAVA_BIN_PATH"] = p
-				break
+// ValidateProfileBlock 只读检查编码与已有标记，供安装操作在产生副作用前使用。
+func ValidateProfileBlock(path, marker string) error {
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
+			info, err := os.Stat(parent)
+			if err == nil {
+				if !info.IsDir() {
+					return fmt.Errorf("profile parent is not a directory: %s", parent)
+				}
+				return nil
+			}
+			if !os.IsNotExist(err) {
+				return err
+			}
+			if filepath.Dir(parent) == parent {
+				return err
 			}
 		}
 	}
-	
+	if err != nil {
+		return err
+	}
+	_, err = renderProfileBlock(content, marker, "")
+	if err != nil {
+		return fmt.Errorf("profile %s: %w", path, err)
+	}
+	return nil
+}
+
+func renderProfileBlock(content []byte, marker, body string) ([]byte, error) {
+	bom := []byte{0xef, 0xbb, 0xbf}
+	hadBOM := bytes.HasPrefix(content, bom)
+	content = bytes.TrimPrefix(content, bom)
+	if !utf8.Valid(content) || bytes.ContainsRune(content, 0) {
+		return nil, fmt.Errorf("unsupported profile encoding; convert it to UTF-8 before continuing")
+	}
+	start := "# " + marker + " - START"
+	end := "# " + marker + " - END"
+	lines := []string{}
+	inside := false
+	for _, line := range strings.Split(string(content), "\n") {
+		t := strings.TrimSpace(line)
+		if t == start {
+			if inside {
+				return nil, fmt.Errorf("nested JVM block")
+			}
+			inside = true
+			continue
+		}
+		if t == end {
+			if !inside {
+				return nil, fmt.Errorf("unmatched JVM block")
+			}
+			inside = false
+			continue
+		}
+		if !inside {
+			lines = append(lines, line)
+		}
+	}
+	if inside {
+		return nil, fmt.Errorf("unfinished JVM block")
+	}
+	result := strings.TrimRight(strings.Join(lines, "\n"), "\r\n")
+	if body != "" {
+		result += "\n\n" + start + "\n" + body + "\n" + end
+	}
+	output := []byte(result + "\n")
+	// Windows PowerShell 5 需要 BOM 才能可靠读取包含中文路径的 UTF-8 配置。
+	if hadBOM || (runtime.GOOS == "windows" && len(output) != utf8.RuneCount(output)) {
+		output = append(bom, output...)
+	}
+	return output, nil
+}
+
+func writeProfileContent(path string, result []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".jvm-profile-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temporary.Name())
+	if _, err = temporary.Write(result); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err = temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err = temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err = temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporary.Name(), path)
+}
+
+func (m *Manager) GetCurrentJavaInfo() (map[string]string, error) {
+	info := map[string]string{}
+	if home := os.Getenv("JAVA_HOME"); home != "" {
+		info["JAVA_HOME"] = home
+	}
+	if path, err := exec.LookPath("java"); err == nil {
+		info["JAVA_BIN_PATH"] = filepath.Dir(path)
+		info["JAVA_EXECUTABLE"] = path
+	}
 	return info, nil
+}
+
+// ConfigureToolPath 配置 jvm 可执行文件入口，不影响 Java 选择。
+func (m *Manager) ConfigureToolPath(dir string, remove bool) error {
+	if err := validatePathEntry(dir, runtime.GOOS == "windows"); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return persistWindowsToolPath(dir, remove)
+	}
+	shell, err := m.DetectShell()
+	if err != nil {
+		return err
+	}
+	body := ""
+	if !remove {
+		if shell.Name == "fish" {
+			body = "fish_add_path " + quoteFish(dir)
+		} else {
+			body = "export PATH=" + quoteSH(dir) + ":\"$PATH\""
+		}
+	}
+	return WriteProfileBlock(shell.ConfigFile, "JVM Tool PATH Configuration", body)
+}
+
+// ClearJavaEnvironment 仅清理正在持久使用的目标，不影响其他安装。
+func (m *Manager) ClearJavaEnvironment(home string) error {
+	if runtime.GOOS == "windows" {
+		return clearWindowsJava(home)
+	}
+	shell, err := m.DetectShell()
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(shell.ConfigFile)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	start := strings.Index(text, "# JVM Java Version Manager - START")
+	end := strings.Index(text, "# JVM Java Version Manager - END")
+	if start < 0 {
+		return nil
+	}
+	if end < start {
+		return fmt.Errorf("unfinished JVM block in %s", shell.ConfigFile)
+	}
+	block := text[start:end]
+	if !strings.Contains(block, "JAVA_HOME="+quoteSH(home)+"\n") && !strings.Contains(block, "JAVA_HOME "+quoteFish(home)+"\n") {
+		return nil
+	}
+	return WriteProfileBlock(shell.ConfigFile, "JVM Java Version Manager", "")
 }

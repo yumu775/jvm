@@ -38,7 +38,7 @@ var scanCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// 创建扫描器
 		javaScanner := scanner.NewScanner()
-		
+
 		// 扫描系统中的 Java 安装
 		var installations []scanner.JavaInstallation
 		var err error
@@ -56,17 +56,17 @@ var scanCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to scan Java installations: %w", err)
 		}
-		
+
 		if len(installations) == 0 {
 			color.Yellow("No Java installations found on this system.")
 			fmt.Println("You can install Java using 'jvm install <version>'")
 			return nil
 		}
-		
+
 		// 显示找到的安装
 		color.Green("Found %d Java installation(s):", len(installations))
 		fmt.Println()
-		
+
 		for i, installation := range installations {
 			fmt.Printf("%d. Java %s\n", i+1, installation.Version)
 			if showDetails {
@@ -81,18 +81,18 @@ var scanCmd = &cobra.Command{
 			}
 			fmt.Println()
 		}
-		
+
 		// 如果用户选择导入所有版本
 		if scanImportAll {
 			return importInstallations(javaScanner, installations)
 		}
-		
+
 		// 提示用户可以导入版本
 		color.Cyan("To import a specific version, use:")
 		color.Cyan("  jvm import <version>")
 		color.Cyan("To import all versions, use:")
 		color.Cyan("  jvm scan --import-all")
-		
+
 		return nil
 	},
 }
@@ -103,12 +103,12 @@ func importInstallations(javaScanner *scanner.Scanner, installations []scanner.J
 	if err != nil {
 		return fmt.Errorf("failed to get versions directory: %w", err)
 	}
-	
+
 	var imported, skipped int
-	
+
 	for _, installation := range installations {
 		color.Blue("Importing Java %s...", installation.Version)
-		
+
 		if err := javaScanner.ImportInstallation(installation, versionsDir); err != nil {
 			color.Red("Failed to import Java %s: %v", installation.Version, err)
 			skipped++
@@ -116,15 +116,18 @@ func importInstallations(javaScanner *scanner.Scanner, installations []scanner.J
 			imported++
 		}
 	}
-	
+
 	fmt.Println()
 	color.Green("Import completed: %d imported, %d skipped", imported, skipped)
-	
+	if skipped > 0 {
+		return fmt.Errorf("failed to import %d installation(s)", skipped)
+	}
+
 	if imported > 0 {
 		fmt.Println("Use 'jvm list' to see all managed versions")
 		fmt.Println("Use 'jvm use <version>' to switch to a version")
 	}
-	
+
 	return nil
 }
 
@@ -132,7 +135,7 @@ func importInstallations(javaScanner *scanner.Scanner, installations []scanner.J
 func init() {
 	// 添加导入所有版本标志
 	scanCmd.Flags().BoolVar(&scanImportAll, "import-all", false, "自动导入所有找到的 Java 版本")
-	
+
 	// 添加显示详细信息标志
 	scanCmd.Flags().BoolVar(&showDetails, "details", false, "显示详细的版本信息")
 

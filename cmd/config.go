@@ -2,11 +2,16 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"jvm/internal/config"
+	"jvm/internal/sources"
+	"jvm/internal/version"
 )
 
 // configCmd 定义了 "jvm config" 命令
@@ -16,9 +21,13 @@ var configCmd = &cobra.Command{
 	Long: `管理 JVM 工具的配置选项。
 
 支持的配置项：
+- install-dir: Java 安装目录（修改后保留旧版本登记，不移动文件）
+- download-dir: 下载缓存目录
 - scan-paths: 自定义 Java 扫描路径
-- auto-scan: 是否自动扫描系统 Java
-- download-sources: 下载源配置
+- auto-scan: list 在没有已管理安装时是否补充扫描系统 Java
+- default-version: jvm use default 使用的已安装版本
+
+下载源使用 jvm sources 管理；config list 显示同一份实际来源配置。
 
 子命令：
   get       获取配置值
@@ -55,6 +64,8 @@ var configSetCmd = &cobra.Command{
 	Long: `设置指定的配置值。
 
 示例：
+  jvm config set install-dir D:\JavaVersions
+  jvm config set download-dir D:\JavaCache
   jvm config set auto-scan true           # 启用自动扫描
   jvm config set auto-scan false          # 禁用自动扫描`,
 	Args: cobra.ExactArgs(2),
@@ -137,8 +148,17 @@ func listConfig() error {
 
 	fmt.Println()
 	color.Green("Download Sources:")
-	for i, source := range cfg.DownloadSources {
-		fmt.Printf("  %d. %s - %s\n", i+1, source.Name, source.URL)
+	manager := sources.NewSourceManager()
+	allSources, err := manager.LoadSources()
+	if err != nil {
+		return err
+	}
+	defaultSource, err := manager.DefaultSource()
+	if err != nil {
+		return err
+	}
+	if err := writeSourcesTable(os.Stdout, allSources, defaultSource); err != nil {
+		return err
 	}
 
 	fmt.Println()
@@ -189,6 +209,38 @@ func setConfig(key, value string) error {
 	}
 
 	switch key {
+	case "install-dir", "download-dir":
+		path, err := config.AbsolutePath(value)
+		if err != nil {
+			return err
+		}
+		if key == "install-dir" {
+			// 修改仓库前登记旧版本，避免目录切换后丢失可见性。
+			manager, err := version.NewManager()
+			if err != nil {
+				return err
+			}
+			installed, err := manager.ListInstalled()
+			if err != nil {
+				return err
+			}
+			for _, item := range installed {
+				record, err := manager.GetRecord(item.Version)
+				if err != nil {
+					return err
+				}
+				if err = manager.Register(item.Version, item.Path, record.Managed); err != nil {
+					return err
+				}
+			}
+			cfg, err = config.LoadConfig()
+			if err != nil {
+				return err
+			}
+			cfg.InstallDir = path
+		} else {
+			cfg.DownloadDir = path
+		}
 	case "auto-scan":
 		if value == "true" {
 			cfg.AutoScan = true
@@ -198,12 +250,42 @@ func setConfig(key, value string) error {
 			return fmt.Errorf("invalid value for auto-scan: %s (use true or false)", value)
 		}
 	case "default-version":
-		cfg.DefaultVersion = value
+		if strings.EqualFold(value, "default") {
+			return fmt.Errorf("default-version cannot refer to itself; select an installed version")
+		}
+		if err := version.ValidateVersion(value); err != nil {
+			return err
+		}
+		manager, err := version.NewManager()
+		if err != nil {
+			return err
+		}
+		resolved, err := manager.Resolve(value)
+		if err != nil {
+			return err
+		}
+		if _, err := manager.GetVersionPath(resolved); err != nil {
+			return err
+		}
+		cfg.DefaultVersion = resolved
+		value = resolved
 	default:
 		return fmt.Errorf("config key '%s' is not settable", key)
 	}
 
-	if err := cfg.SaveConfig(); err != nil {
+	if err := config.Update(func(current *config.Config) error {
+		switch key {
+		case "install-dir":
+			current.InstallDir = cfg.InstallDir
+		case "download-dir":
+			current.DownloadDir = cfg.DownloadDir
+		case "auto-scan":
+			current.AutoScan = cfg.AutoScan
+		case "default-version":
+			current.DefaultVersion = cfg.DefaultVersion
+		}
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -213,66 +295,51 @@ func setConfig(key, value string) error {
 
 // addScanPath 添加扫描路径
 func addScanPath(path string) error {
-	cfg, err := config.LoadConfig()
+	normalized, err := config.AbsolutePath(path)
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+		return err
 	}
-
-	// 检查路径是否已存在
-	for _, existingPath := range cfg.CustomScanPaths {
-		if existingPath == path {
-			color.Yellow("Path already exists: %s", path)
-			return nil
+	err = config.Update(func(c *config.Config) error {
+		for _, p := range c.CustomScanPaths {
+			if sameScanPath(p, normalized) {
+				return nil
+			}
 		}
-	}
-
-	// 添加路径
-	cfg.CustomScanPaths = append(cfg.CustomScanPaths, path)
-
-	if err := cfg.SaveConfig(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-
-	color.Green("Added scan path: %s", path)
-	color.Cyan("Use 'jvm scan' or 'jvm import --from %s' to scan this path", path)
-
-	return nil
-}
-
-// removeScanPath 移除扫描路径
-func removeScanPath(path string) error {
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// 查找并移除路径
-	found := false
-	var newPaths []string
-	for _, existingPath := range cfg.CustomScanPaths {
-		if existingPath != path {
-			newPaths = append(newPaths, existingPath)
-		} else {
-			found = true
-		}
-	}
-
-	if !found {
-		color.Yellow("Path not found: %s", path)
+		c.CustomScanPaths = append(c.CustomScanPaths, normalized)
 		return nil
+	})
+	if err == nil {
+		color.Green("Added scan path: %s", normalized)
 	}
-
-	cfg.CustomScanPaths = newPaths
-
-	if err := cfg.SaveConfig(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-
-	color.Green("Removed scan path: %s", path)
-	return nil
+	return err
 }
 
-// getValueOrDefault 获取值或默认值
+func removeScanPath(path string) error {
+	normalized, err := config.AbsolutePath(path)
+	if err != nil {
+		return err
+	}
+	return config.Update(func(c *config.Config) error {
+		var paths []string
+		for _, p := range c.CustomScanPaths {
+			if !sameScanPath(p, normalized) {
+				paths = append(paths, p)
+			}
+		}
+		c.CustomScanPaths = paths
+		return nil
+	})
+}
+
+func sameScanPath(a, b string) bool {
+	a = filepath.Clean(a)
+	b = filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
 func getValueOrDefault(value, defaultValue string) string {
 	if value == "" {
 		return defaultValue
