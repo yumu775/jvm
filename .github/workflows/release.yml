@@ -1,0 +1,59 @@
+name: Build release archives
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go test ./... -timeout=3m
+      - name: Build and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_flags='-s -w'
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo 'Release tags must use vMAJOR.MINOR.PATCH with an optional suffix.' >&2
+              exit 1
+            fi
+            build_flags="$build_flags -X jvm/cmd.Version=$GITHUB_REF_NAME"
+          fi
+          mkdir -p dist
+          for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            folder="jvm-${os}-${arch}"
+            mkdir -p "dist/$folder"
+            binary=jvm
+            if [ "$os" = windows ]; then binary=jvm.exe; fi
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$build_flags" -o "dist/$folder/$binary" .
+            cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md "dist/$folder/"
+            cp -R docs "dist/$folder/"
+            if [ "$os" = windows ]; then
+              cp quick-setup.ps1 setup-jvm.bat install-jvm.bat "dist/$folder/"
+              (cd dist && zip -r "$folder.zip" "$folder")
+            else
+              cp install-jvm.sh "dist/$folder/"
+              tar -czf "dist/$folder.tar.gz" -C dist "$folder"
+            fi
+          done
+          cd dist
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archives
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS

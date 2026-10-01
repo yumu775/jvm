@@ -1,76 +1,53 @@
-# JVM Tool Quick Setup Script
-# Simple script to configure JVM tool environment
-
-Write-Host "=== JVM Tool Quick Setup ===" -ForegroundColor Blue
-Write-Host ""
-
-# Check if jvm.exe exists
-$jvmExe = ".\jvm.exe"
-if (-not (Test-Path $jvmExe)) {
-    Write-Host "Error: jvm.exe not found in current directory" -ForegroundColor Red
-    Write-Host "Please run this script from the directory containing jvm.exe" -ForegroundColor Yellow
-    exit 1
+﻿param(
+    [string]$InstallPath,
+    [switch]$Force = $true,
+    [switch]$NoProfile
+)
+$ErrorActionPreference = 'Stop'
+# 使用参数数组传递路径，所有持久配置由工具统一处理。
+$jvmExe = Join-Path $PSScriptRoot 'jvm.exe'
+if (-not (Test-Path -LiteralPath $jvmExe -PathType Leaf)) {
+    throw 'jvm.exe not found beside this script.'
+}
+$targetDirectory = $PSScriptRoot
+$setupArguments = @('setup')
+if ($InstallPath) {
+    $targetDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallPath)
+    $setupArguments += @('--path', $targetDirectory)
+}
+if ($Force) { $setupArguments += '--force' }
+if (-not $NoProfile) {
+    $profilePath = $PROFILE.CurrentUserAllHosts
+    if (-not $profilePath) { throw 'PowerShell CurrentUserAllHosts profile path could not be determined.' }
+    $setupArguments += @('--powershell-profile', $profilePath)
 }
 
-Write-Host "Found JVM tool: $(Get-Location)\jvm.exe" -ForegroundColor Green
+& $jvmExe @setupArguments
+if ($LASTEXITCODE -ne 0) { throw "JVM setup failed (exit code $LASTEXITCODE)." }
 
-# Check if already in PATH
-$currentDir = Get-Location
-$currentPath = $env:PATH
-if ($currentPath -like "*$currentDir*") {
-    Write-Host "JVM tool is already in PATH!" -ForegroundColor Green
-    Write-Host "Test with: jvm --version" -ForegroundColor Cyan
-    exit 0
+$installedExe = Join-Path $targetDirectory 'jvm.exe'
+if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
+    throw "Setup returned success but the installed executable is missing: $installedExe"
 }
 
-Write-Host "Configuring JVM tool environment..." -ForegroundColor Blue
-
-# Run JVM setup command
-try {
-    & $jvmExe setup --force
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Setup completed successfully!" -ForegroundColor Green
-    } else {
-        Write-Host "Setup command failed, trying manual configuration..." -ForegroundColor Yellow
-        
-        # Manual PowerShell profile configuration
-        $profilePath = $PROFILE
-        if (-not $profilePath) {
-            $profilePath = "$env:USERPROFILE\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1"
-        }
-        
-        # Create profile directory if it doesn't exist
-        $profileDir = Split-Path $profilePath -Parent
-        if (-not (Test-Path $profileDir)) {
-            New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
-        }
-        
-        # Add to profile
-        $pathLine = "`$env:PATH = `"$currentDir;`" + `$env:PATH"
-        
-        if (Test-Path $profilePath) {
-            $content = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
-            if ($content -notlike "*JVM Tool PATH*") {
-                Add-Content $profilePath "`n# JVM Tool PATH Configuration`n$pathLine`n"
-                Write-Host "Added to PowerShell profile: $profilePath" -ForegroundColor Green
-            } else {
-                Write-Host "Already configured in PowerShell profile" -ForegroundColor Green
-            }
-        } else {
-            Set-Content $profilePath "# JVM Tool PATH Configuration`n$pathLine`n"
-            Write-Host "Created PowerShell profile: $profilePath" -ForegroundColor Green
-        }
-    }
-} catch {
-    Write-Host "Error running setup: $_" -ForegroundColor Red
-    exit 1
+# 仅在配置成功后刷新调用此脚本的 PowerShell 环境，不合并旧的机器 PATH。
+$normalizedTarget = $targetDirectory.TrimEnd([char[]]'\/')
+$remainingPath = @($env:PATH -split ';' | Where-Object {
+    $_ -and -not [string]::Equals($_.Trim().Trim('"').TrimEnd([char[]]'\/'), $normalizedTarget, [StringComparison]::OrdinalIgnoreCase)
+})
+$env:PATH = (@($targetDirectory) + $remainingPath) -join ';'
+$integration = & $installedExe init powershell | Out-String
+if ($LASTEXITCODE -ne 0) { throw "PowerShell integration generation failed (exit code $LASTEXITCODE)." }
+if ([string]::IsNullOrWhiteSpace($integration)) { throw 'PowerShell integration was empty.' }
+Invoke-Expression $integration
+if (-not (Get-Command jvm -CommandType Function -ErrorAction SilentlyContinue)) {
+    throw 'PowerShell integration did not define the jvm function.'
 }
-
-Write-Host ""
-Write-Host "=== Next Steps ===" -ForegroundColor Blue
-Write-Host "1. Restart PowerShell or run: . `$PROFILE" -ForegroundColor Cyan
-Write-Host "2. Test with: jvm --version" -ForegroundColor Cyan
-Write-Host "3. Start using: jvm list" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Quick test in new PowerShell window:" -ForegroundColor Yellow
-Write-Host "  Start-Process powershell -ArgumentList '-NoExit', '-Command', 'jvm --version'" -ForegroundColor White
+jvm --version
+if ($LASTEXITCODE -ne 0) { throw "Installed JVM verification failed (exit code $LASTEXITCODE)." }
+Write-Host "JVM is ready in this PowerShell session: $installedExe"
+if ($NoProfile) {
+    Write-Host 'Profile integration skipped. This session is ready; future sessions can load jvm init powershell.'
+} else {
+    Write-Host "Future PowerShell sessions will load JVM integration from: $profilePath"
+}

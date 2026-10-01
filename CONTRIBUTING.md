@@ -1,257 +1,82 @@
-# Contributing to JVM Tool
+# 开发与贡献
 
-Thank you for your interest in contributing to JVM Tool! This document provides guidelines and information for contributors.
+## 环境
 
-## 🚀 Getting Started
+需要 Go 1.21 或更高版本。Windows 是主要交互验证平台，代码应保持 macOS/Linux 可构建。注释使用中文，错误信息和 CLI 文案保持语义明确。
 
-### Prerequisites
-
-- Go 1.21 or higher
-- Git
-- Basic understanding of Java version management
-
-### Development Setup
-
-1. **Fork and Clone**
-   ```bash
-   git clone https://github.com/yumu775/jvm.git
-   cd jvm
-   ```
-
-2. **Install Dependencies**
-   ```bash
-   go mod tidy
-   ```
-
-3. **Build and Test**
-   ```bash
-   go build -o jvm
-   ./jvm --help
-   ```
-
-4. **Set up Development Environment**
-   ```bash
-   # Configure for development
-   ./jvm setup
-   ```
-
-## 🛠️ Development Guidelines
-
-### Code Style
-
-- Follow standard Go conventions
-- Use `gofmt` for formatting
-- Add comments for exported functions
-- Keep functions focused and small
-- Use meaningful variable and function names
-
-### Project Structure
-
-```
-jvm-tool/
-├── cmd/                 # Command implementations
-├── internal/           # Internal packages
-│   ├── alias/         # Version alias management
-│   ├── config/        # Configuration management
-│   ├── download/      # Download functionality
-│   ├── env/           # Environment management
-│   ├── install/       # Installation logic
-│   ├── scanner/       # System scanning
-│   ├── sources/       # Download sources
-│   ├── uninstall/     # Uninstallation logic
-│   └── version/       # Version management
-├── main.go            # Entry point
-└── README.md          # Documentation
+```sh
+go mod download
+go build -trimpath -o build/ .
+go test ./... -count=1 -timeout=3m
+go vet ./...
 ```
 
-### Adding New Commands
+运行开发二进制请使用完整路径，例如 `./build/jvm` 或 `.\build\jvm.exe`，避免调用旧版 PATH 中的工具。测试或开发不要求先执行 setup。
 
-1. Create a new file in `cmd/` directory
-2. Follow the existing command pattern
-3. Add the command to `cmd/root.go`
-4. Update help text and documentation
-5. Add tests if applicable
+## 安全隔离
 
-### Adding New Features
+- 默认测试使用 `t.TempDir()` 和独立的 `JVM_HOME`。
+- 测试不能设置真实用户/机器环境，不能编辑真实 shell profile。
+- Windows 环境操作通过 `EnvironmentStore` 内存替身验证。
+- HTTP 行为通过 `httptest` 验证，不依赖公网或下载真实 JDK。
+- 符号链接测试在平台权限不足时可以跳过，但普通路径穿越测试必须执行。
+- 网络实测只用于单独的元数据冒烟验证，不加入默认测试。
+- 安装、卸载和迁移的失败路径必须验证原数据仍受保护。
 
-1. **Plan First**: Open an issue to discuss the feature
-2. **Design**: Consider cross-platform compatibility
-3. **Implement**: Follow existing patterns
-4. **Test**: Test on multiple platforms if possible
-5. **Document**: Update README and help text
+## 设计约束
 
-## 🧪 Testing
+个人学习资料不属于应用交付内容。根目录的三份 Go/JVM 学习文档已加入 `.gitignore`；新增私人笔记统一放入忽略的 `learning/` 或 `personal-notes/` 目录。不要用 `git add -f` 将其加入提交。源码、回归测试和面向用户的 `docs/` 文档正常提交。
 
-### Manual Testing
+保持命令层编排、配置、版本定位、环境操作和下载职责清晰。所有版本定位复用 `version.Manager`，不要在新命令中重新拼默认仓库。配置修改优先使用 `config.Update`，避免多个命令覆盖彼此的修改。
 
-```bash
-# Test basic functionality
-jvm list
-jvm install latest
-jvm use 17
-jvm current
+新增功能需要同步 CLI help、README、CHANGELOG 和相关指南。不能仅添加成功提示来占位；未实现能力必须明确不可用。不得把环境已保存与当前 shell 已激活混为一谈。
 
-# Test platform-specific features
-jvm platform info
-jvm setup
+输入路径归一化为绝对路径；删除仅针对合法托管记录，外部导入目录永远不因为取消登记被删除。shell 输出模式的 stdout 只能包含脚本，错误输出到 stderr 且返回非零。
 
-# Test scanning and importing
-jvm scan
-jvm import --all
+## 检查清单
+
+```sh
+gofmt -w cmd internal main.go
+go vet ./...
+go test ./... -count=1 -timeout=3m
 ```
 
-### Cross-Platform Testing
+在支持 race detector 的环境额外执行：
 
-- Test on Windows (PowerShell and CMD)
-- Test on macOS (Bash and Zsh)
-- Test on Linux (Bash, Zsh, Fish)
-
-## 📝 Commit Guidelines
-
-### Commit Message Format
-
-```
-<type>(<scope>): <description>
-
-[optional body]
-
-[optional footer]
+```sh
+go test -race ./... -timeout=3m
 ```
 
-### Types
+CI 的操作系统矩阵为 Windows、macOS、Linux，Go 矩阵为 1.21 与 stable。更改平台相关代码时，不应将单机通过表述为所有平台实测通过。
 
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation changes
-- `style`: Code style changes
-- `refactor`: Code refactoring
-- `test`: Adding tests
-- `chore`: Maintenance tasks
+## 回归重点
 
-### Examples
+| 范围 | 必须验证 |
+| --- | --- |
+| 环境 | 保留无关 PATH、注册表类型与失败回滚、临时不持久化、脚本引用安全 |
+| 配置 | 旧配置默认值、绝对目录、修改仓库后旧版本可见、并发更新 |
+| 安装 | 校验失败、恶意归档、旧版本保留、登记失败恢复、完整版本 ID |
+| 卸载 | 外部文件保留、活动版本保护、受保护目录与路径穿越 |
+| 版本 | 数字排序、完整版本和前缀、LTS 主版本去重、指定下载源 |
+| 扫描 | 根目录本身、深度限制、符号链接循环、执行超时 |
 
-```
-feat(alias): add support for custom version aliases
+## 发布
 
-fix(windows): resolve symbolic link detection issue
+`.github/workflows/release.yml` 可手工触发或由版本标签触发，只构建并上传 Actions artifacts，不自动发布外部 Release。
 
-docs(readme): update installation instructions
+标签构建使用 `vMAJOR.MINOR.PATCH`（可附预发布后缀）作为程序版本；在分支上手动构建保留源码中的开发版本，不能把 `main` 等分支名当成发布版本。
 
-refactor(config): simplify configuration loading logic
-```
+发布前确认：
 
-## 🐛 Bug Reports
+1. CI 通过，补充真实 CMD/PowerShell 与 IDE 验证记录。
+2. CHANGELOG 对应实际功能；升级指南描述不兼容变化。
+3. 通过 `-ldflags "-X jvm/cmd.Version=<版本>"` 注入版本号。
+4. 打包 Windows/Linux/macOS 的 amd64/arm64 可执行文件、安装脚本、README 和 LICENSE。
+5. 校验压缩包 SHA-256，运行各平台帮助与版本命令。
+6. 发布行为由维护者明确执行，不把未验证的开发构建标为稳定版。
 
-When reporting bugs, please include:
+## 报告问题
 
-1. **Environment Information**
-   - Operating system and version
-   - Go version
-   - JVM tool version
+提供工具版本、系统与 shell 版本、`jvm env` 和 `jvm config list` 的相关输出、复现命令、实际与预期结果。输出可能包含用户名和本地目录，提交前可自行脱敏。
 
-2. **Steps to Reproduce**
-   - Clear, step-by-step instructions
-   - Expected vs actual behavior
-
-3. **Additional Context**
-   - Error messages
-   - Log output
-   - Screenshots if applicable
-
-## 💡 Feature Requests
-
-For feature requests:
-
-1. **Check Existing Issues**: Avoid duplicates
-2. **Describe the Problem**: What need does this address?
-3. **Propose a Solution**: How should it work?
-4. **Consider Alternatives**: Are there other approaches?
-
-## 🔄 Pull Request Process
-
-1. **Create a Branch**
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-2. **Make Changes**
-   - Follow coding guidelines
-   - Add tests if applicable
-   - Update documentation
-
-3. **Test Thoroughly**
-   - Test on your platform
-   - Consider cross-platform implications
-
-4. **Submit PR**
-   - Clear title and description
-   - Reference related issues
-   - Include testing notes
-
-5. **Address Feedback**
-   - Respond to review comments
-   - Make requested changes
-   - Keep the PR updated
-
-## 📚 Documentation
-
-### Updating Documentation
-
-- Update README.md for user-facing changes
-- Update help text for command changes
-- Add examples for new features
-- Update CHANGELOG.md
-
-### Writing Style
-
-- Use clear, concise language
-- Include practical examples
-- Consider different user skill levels
-- Test all documented commands
-
-## 🤝 Community
-
-### Code of Conduct
-
-- Be respectful and inclusive
-- Focus on constructive feedback
-- Help others learn and grow
-- Maintain a welcoming environment
-
-### Getting Help
-
-- Check existing documentation
-- Search existing issues
-- Ask questions in discussions
-- Be specific about your problem
-
-## 🎯 Areas for Contribution
-
-### High Priority
-
-- Cross-platform testing and fixes
-- Performance improvements
-- Error handling enhancements
-- Documentation improvements
-
-### Medium Priority
-
-- New download sources
-- Additional shell support
-- GUI development
-- IDE integrations
-
-### Low Priority
-
-- Code refactoring
-- Additional aliases
-- Cosmetic improvements
-- Advanced features
-
-## 📄 License
-
-By contributing to JVM Tool, you agree that your contributions will be licensed under the MIT License.
-
----
-
-Thank you for contributing to JVM Tool! Your efforts help make Java version management easier for everyone. 🙏
+代码提交建议使用 Conventional Commits，例如 `fix(env): preserve unrelated user PATH entries`。贡献遵循 [MIT 许可证](LICENSE)。

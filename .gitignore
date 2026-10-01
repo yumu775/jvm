@@ -219,3 +219,13 @@ local-test.*
 notes.md
 TODO.personal.md
 NOTES.txt
+/Go语法速查表.md
+/Go语言学习指南-基于JVM项目.md
+/JVM项目代码详解.md
+/learning/
+/personal-notes/
+
+# 本地 AI 工具配置与凭据
+/.agents/
+/.codex/
+/.aws/
